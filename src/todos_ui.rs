@@ -11,6 +11,7 @@ use rune_kit::{
 
 use crate::api::{Task, TaskList};
 use crate::dates;
+use crate::updates::Status;
 use crate::session::Session;
 use crate::todos::{Event, Load};
 use crate::{App, MenuTarget, NEW_LIST, Section};
@@ -66,11 +67,44 @@ pub(crate) fn sidebar_frame(s: &App, session: &Session, k: &Kit) -> Sidebar {
         .on_pick(|s: &mut App, i, _: &mut Tx| s.set_section(if i == 0 { Section::Tasks } else { Section::Notes }))
         .build(k)
         .key("section");
-    Sidebar::new()
+    let sb = Sidebar::new()
         .header_padding(4.0, 8.0)
         .header(brand(k))
-        .header(row().key("section-row").w_full().px(4.0).pb(8.0).child(pick))
-        .footer(account(session, k))
+        .header(row().key("section-row").w_full().px(4.0).pb(8.0).child(pick));
+    let sb = match update_ready(s, k) {
+        Some(banner) => sb.footer(banner),
+        None => sb,
+    };
+    sb.footer(account(session, k))
+}
+
+/// "Version x is ready", with a button to restart into it, once an update has downloaded.
+fn update_ready(s: &App, k: &Kit) -> Option<El> {
+    let Status::Ready(version) = s.updates.status() else { return None };
+    Some(
+        row()
+            .key("update")
+            .w_full()
+            .px(8.0)
+            .py(6.0)
+            .gap(8.0)
+            .center_y()
+            .child(
+                col()
+                    .grow(1.0)
+                    .shrink()
+                    .child(text(format!("Version {version} is ready")).font(k.ty.small_medium).color(k.c.text_base))
+                    .child(text("Restart to update").font(k.ty.small).color(k.c.text_muted)),
+            )
+            .child(
+                Button::new("Restart")
+                    .variant(ButtonVariant::Submit)
+                    .control_size(ControlSize::Small)
+                    .on_press_tx(|s: &mut App, tx: &mut Tx| s.restart_to_update(tx))
+                    .build(k)
+                    .key("update-restart"),
+            ),
+    )
 }
 
 fn tasks_split(s: &App, session: &Session, k: &Kit, cx: &mut Cx<App>, layer: &mut Vec<El>) -> El {

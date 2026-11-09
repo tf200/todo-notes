@@ -91,28 +91,40 @@ pub trait TokenStore: Send + Sync {
     fn clear(&self);
 }
 
-/// Windows Credential Manager (Keychain on macOS, Secret Service on Linux).
-pub struct Keyring;
+/// Windows Credential Manager (Keychain on macOS, Secret Service on Linux), one entry per
+/// server: a sign-in on the dev server is never sent to the live one.
+pub struct Keyring {
+    user: String,
+}
 
 impl Keyring {
-    fn entry() -> Option<keyring::Entry> {
-        keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()
+    pub fn for_server(base: &str) -> Keyring {
+        let user = if base == crate::api::DEFAULT_BASE_URL {
+            KEYRING_USER.to_string()
+        } else {
+            format!("{KEYRING_USER} {base}")
+        };
+        Keyring { user }
+    }
+
+    fn entry(&self) -> Option<keyring::Entry> {
+        keyring::Entry::new(KEYRING_SERVICE, &self.user).ok()
     }
 }
 
 impl TokenStore for Keyring {
     fn load(&self) -> Option<String> {
-        Self::entry()?.get_password().ok()
+        self.entry()?.get_password().ok()
     }
 
     fn save(&self, token: &str) {
-        if let Some(entry) = Self::entry() {
+        if let Some(entry) = self.entry() {
             let _ = entry.set_password(token);
         }
     }
 
     fn clear(&self) {
-        if let Some(entry) = Self::entry() {
+        if let Some(entry) = self.entry() {
             let _ = entry.delete_credential();
         }
     }

@@ -114,7 +114,7 @@ mod live {
 
     /// Signs in with the dev account: the tokens, and the API to use them with.
     fn sign_in() -> (Api, Tokens) {
-        let base = std::env::var("TODO_API_URL").unwrap_or_else(|_| crate::api::DEFAULT_BASE_URL.into());
+        let base = std::env::var("TODO_API_URL").unwrap_or_else(|_| crate::api::DEV_BASE_URL.into());
         let api = Api::new(base);
         let tokens = api
             .login(&std::env::var("TODO_DEV_EMAIL").unwrap(), &std::env::var("TODO_DEV_PASSWORD").unwrap())

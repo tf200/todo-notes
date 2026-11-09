@@ -7,7 +7,12 @@ use serde_json::json;
 
 use crate::session::{Renew, Tokens};
 
-pub const DEFAULT_BASE_URL: &str = "http://localhost:8090";
+/// The live server. `TODO_API_URL` points the app elsewhere (the dev server: `DEV_BASE_URL`).
+pub const DEFAULT_BASE_URL: &str = "https://todo.loket.site";
+
+/// The dev stack in WSL (`docker compose -f docker-compose.dev.yml`); the live tests use it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const DEV_BASE_URL: &str = "http://localhost:8090";
 
 /// What went wrong, in terms the UI can show. Raw server text never reaches the screen.
 #[derive(Debug, Clone, PartialEq)]

@@ -2,7 +2,10 @@
 //!
 //! Run: `cargo run`. Headless (no window, no credential store):
 //! `cargo run -- --snap out.png [--scene error] [--theme light]`.
-//! Server: `TODO_API_URL` (default `http://localhost:8090`).
+//! Server: `TODO_API_URL` (default `https://todo.loket.site`; the dev stack is `http://localhost:8090`).
+
+// Release builds are a windowed app on Windows: no console window opens beside it.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
 mod auth;
@@ -15,6 +18,7 @@ mod session;
 mod todos;
 mod todos_ui;
 mod ui;
+mod updates;
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -100,6 +104,9 @@ pub struct App {
     note_loaded: Option<String>,
     /// The editor shows the rendered Markdown instead of the source.
     pub note_preview: bool,
+
+    /// New versions, found and downloaded in the background.
+    pub updates: updates::Updates,
 }
 
 /// Seconds after the last keystroke before an edit saves itself.
@@ -425,6 +432,16 @@ impl App {
         self.renaming = Some(id);
     }
 
+    /// Saves what's open, then closes so Velopack can install the downloaded version and start
+    /// it again (closing runs `on_close`, which lets queued saves reach the server first).
+    pub fn restart_to_update(&mut self, tx: &mut Tx) {
+        self.save_open_task();
+        self.save_open_note();
+        if self.updates.restart_into_update() {
+            tx.close_window();
+        }
+    }
+
     pub fn commit_rename(&mut self) {
         let title = self.rename.text.clone();
         match self.renaming.take() {
@@ -441,8 +458,8 @@ fn headless() -> bool {
 
 fn init() -> App {
     // Headless runs (screenshots, scripted checks) never read or write the real credential store.
-    let store: Arc<dyn TokenStore> = if headless() { Arc::new(NoStore) } else { Arc::new(Keyring) };
     let base = std::env::var("TODO_API_URL").unwrap_or_else(|_| api::DEFAULT_BASE_URL.to_string());
+    let store: Arc<dyn TokenStore> = if headless() { Arc::new(NoStore) } else { Arc::new(Keyring::for_server(&base)) };
     let mut email = TextEdit::new("");
     email.focused = true;
     App {
@@ -480,10 +497,15 @@ fn init() -> App {
         note_body: TextEdit::new(""),
         note_loaded: None,
         note_preview: false,
+        updates: updates::Updates::off(),
     }
 }
 
 fn setup(s: &mut App, waker: Waker) {
+    ui::load_logo(waker.clone(), headless());
+    if !headless() {
+        s.updates = updates::Updates::start(waker.clone());
+    }
     s.sent.set_waker(waker.clone());
     s.checked.set_waker(waker.clone());
     s.backend = Some(Backend::start(s.api.clone(), waker));
@@ -504,6 +526,9 @@ fn poll(s: &mut App, now: f64, _tx: &mut Tx) -> bool {
     }
     if let Some((attempt, result)) = s.checked.take() {
         s.dispatch(Event::Checked { attempt, result });
+        changed = true;
+    }
+    if s.updates.poll() {
         changed = true;
     }
     // Due labels say "Today": follow the date past midnight.
@@ -556,6 +581,11 @@ fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
 }
 
 fn main() {
+    // First, before anything else: Velopack's install, update and uninstall hooks run the
+    // exe with special arguments and exit here. It also applies an update downloaded earlier.
+    velopack::VelopackApp::build().run();
+    // The window's, taskbar's and Dock's icon (Linux takes it from the AppImage's .desktop).
+    let _ = rune::set_app_icon(ui::ICON_PNG);
     rune::App::new(AppSpec {
         min_size: Some((420.0, 560.0)),
         fonts: rune_theme_opencode::FONTS,

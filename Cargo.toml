@@ -15,8 +15,24 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Installs and updates (Setup.exe, AppImage, .pkg), fed from the GitHub releases.
+velopack = "1.2.161"
+
+# Saved logins: Credential Manager, the macOS Keychain, or the Secret Service (GNOME Keyring,
+# KWallet) on Linux, which is reached over D-Bus in pure Rust, so the AppImage needs no libdbus.
+[target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
 
 [profile.dev.package."*"]
 # Dependencies (the renderer, text shaping) build optimised, so debug runs stay smooth.
 opt-level = 2
+
+[profile.release]
+# Smaller downloads: no symbols in the shipped binary.
+strip = true

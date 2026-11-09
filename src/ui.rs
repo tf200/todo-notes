@@ -1,8 +1,8 @@
 //! The sign-in screen, built from rune-kit components on the OpenCode theme.
 
-use std::f32::consts::PI;
+use std::sync::OnceLock;
 
-use rune::{Color, Cx, El, LineCap, Path, Shape, TextStyle, Tx, canvas, col, el, row, text};
+use rune::{Color, Cx, El, Image, ImageCache, TextStyle, Tx, col, el, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Spinner, TextInput};
 
 use crate::App;
@@ -48,20 +48,38 @@ fn card(k: &Kit) -> El {
         .shadow(12.0, 32.0, Color::BLACK.alpha(if k.dark { 0.35 } else { 0.08 }))
 }
 
+/// The account avatar's gradient.
 pub const LOGO_FROM: Color = Color { r: 0.39, g: 0.40, b: 0.95, a: 1.0 }; // indigo
 pub const LOGO_TO: Color = Color { r: 0.66, g: 0.33, b: 0.97, a: 1.0 }; // violet
 
-/// Placeholder logo: a white check on an indigo-to-violet rounded tile.
+/// The app icon: the cairn on its dark tile (`assets/icon`, built by `scripts/make_icons.py`).
+pub const ICON_PNG: &[u8] = include_bytes!("../assets/icon/icon-256.png");
+/// The icon's tile colour, shown while the image decodes.
+const TILE: Color = Color { r: 0.227, g: 0.227, b: 0.227, a: 1.0 };
+
+/// The decoded icon, and the cache that keeps it (loaded once, in `setup`).
+static LOGO: OnceLock<(ImageCache, Image)> = OnceLock::new();
+
+/// Starts decoding the logo; `wait` blocks until it's ready (headless snapshots).
+pub fn load_logo(waker: rune::Waker, wait: bool) {
+    let logo = LOGO.get_or_init(|| {
+        let cache = ImageCache::new(waker);
+        let image = cache.load(ICON_PNG.to_vec());
+        (cache, image)
+    });
+    if wait {
+        let _ = logo.1.wait();
+    }
+}
+
 pub fn logo(size: f32) -> El {
-    // Drawn in a 24 × 24 box and stretched to the tile.
-    let check = Path::new().move_to([7.0, 12.5]).line_to([10.5, 16.0]).line_to([17.0, 8.5]);
-    let mark = Shape::new().stroke_path(&check, 2.6, LineCap::Round, Color::WHITE).view_box(24.0, 24.0);
-    el().key("logo")
-        .size(size, size)
-        .radius(size * 0.28)
-        .linear_gradient(PI * 0.75, [(0.0, LOGO_FROM), (1.0, LOGO_TO)])
-        .shadow(size * 0.1, size * 0.4, LOGO_TO.alpha(0.35))
-        .child(canvas(mark).size(size, size))
+    // The tile colour shows until the image decodes; its pixels then paint over it by
+    // themselves (a pending image draws nothing and wakes the window when ready).
+    let tile = el().key("logo").size(size, size).radius(size * 0.225).fill(TILE);
+    match LOGO.get() {
+        Some((_, image)) => tile.pixels(image.pixels()),
+        None => tile,
+    }
 }
 
 fn brand(k: &Kit) -> El {
@@ -302,6 +320,10 @@ pub const SCENES: &[(&str, fn(&mut App))] = &[
         sample_todos(s, 0);
         s.open_task("t2".into());
         s.toggle_due_picker();
+    }),
+    ("update-ready", |s| {
+        sample_todos(s, 0);
+        s.updates = crate::updates::Updates::showing(crate::updates::Status::Ready("0.2.0".into()));
     }),
     ("todos-due-empty", |s| {
         sample_todos(s, 0);
