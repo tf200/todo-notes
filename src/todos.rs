@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use crate::api::{ApiError, Task, TaskList, TaskPatch};
+use crate::api::{ApiError, Note, NotePatch, Task, TaskList, TaskPatch};
 
 #[cfg(test)]
 mod tests;
@@ -64,6 +64,11 @@ pub enum Op {
     CreateTask { tmp: String, list: String, title: String },
     UpdateTask { id: String, patch: TaskPatch },
     DeleteTask { id: String },
+    // Notes (`notes.rs`).
+    LoadNotes,
+    CreateNote { tmp: String, title: String, body: String },
+    UpdateNote { id: String, patch: NotePatch },
+    DeleteNote { id: String },
 }
 
 /// A finished request.
@@ -75,6 +80,18 @@ pub enum Reply {
     TaskCreated { tmp: String, list: String, result: Result<Task, ApiError> },
     /// A rename, update or delete.
     Saved(Result<(), ApiError>),
+    // Notes (`notes.rs`).
+    Notes(Result<Vec<Note>, ApiError>),
+    NoteCreated { tmp: String, result: Result<Note, ApiError> },
+    NoteSaved(Result<Note, ApiError>),
+    NoteDeleted(Result<(), ApiError>),
+}
+
+impl Reply {
+    /// Whether the notes model handles this reply (else the todo model does).
+    pub fn is_note(&self) -> bool {
+        matches!(self, Reply::Notes(_) | Reply::NoteCreated { .. } | Reply::NoteSaved(_) | Reply::NoteDeleted(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -180,7 +197,7 @@ impl Todos {
 }
 
 /// Why a request failed, for a notice.
-fn reason(e: &ApiError) -> &'static str {
+pub fn reason(e: &ApiError) -> &'static str {
     match e {
         ApiError::Unreachable => "Can't reach the server.",
         ApiError::NotFound => "It was deleted somewhere else.",
@@ -426,5 +443,7 @@ fn reply_step(t: &mut Todos, reply: Reply, fx: &mut Vec<Effect>) {
         }
         Reply::Saved(Ok(())) => {}
         Reply::Saved(Err(e)) => t.failed("Couldn't save your change.", &e, fx),
+        // `notes::step` handles these; `main.rs` routes them there.
+        Reply::Notes(_) | Reply::NoteCreated { .. } | Reply::NoteSaved(_) | Reply::NoteDeleted(_) => {}
     }
 }

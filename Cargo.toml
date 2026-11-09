@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 # Rune pins a `dev` rev; `dev` is never rewritten. Bump all three together.
 rune = { git = "https://github.com/anomalyco/rune", rev = "a6a59e697df7e7a7c95b91c915d1a24e00681760" }
-rune-kit = { git = "https://github.com/anomalyco/rune", rev = "a6a59e697df7e7a7c95b91c915d1a24e00681760" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "a6a59e697df7e7a7c95b91c915d1a24e00681760", features = ["markdown"] }
 rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "a6a59e697df7e7a7c95b91c915d1a24e00681760" }
 
 ureq = { version = "3", features = ["json"] }

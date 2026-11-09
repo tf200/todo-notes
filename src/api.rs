@@ -84,6 +84,34 @@ pub struct TaskPatch {
     pub done: Option<bool>,
 }
 
+/// A note (`/api/notes`). The body is Markdown.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Note {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub created_at: String,
+    /// RFC 3339; the last content edit (pinning doesn't count).
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// The fields of a note to change (`PUT /api/notes/:id`); `None` leaves a field as it is.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct NotePatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+}
+
 #[derive(Deserialize)]
 struct TokenBody {
     token: String,
@@ -198,6 +226,38 @@ impl Api {
     /// `DELETE /api/tasks/:id`.
     pub fn delete_task(&self, token: &str, id: &str) -> Result<(), ApiError> {
         let req = self.agent.delete(self.url(&format!("/api/tasks/{id}"))).header("Authorization", bearer(token));
+        self.expect_ok(req.call())
+    }
+
+    /// `GET /api/notes`: the user's notes, most recently edited first.
+    pub fn notes(&self, token: &str) -> Result<Vec<Note>, ApiError> {
+        let req = self.agent.get(self.url("/api/notes")).header("Authorization", bearer(token));
+        self.read_vec::<Note>(req.call())
+    }
+
+    /// `POST /api/notes`.
+    pub fn create_note(&self, token: &str, title: &str, body: &str) -> Result<Note, ApiError> {
+        let req = self.agent.post(self.url("/api/notes")).header("Authorization", bearer(token));
+        let (status, mut resp) = self.send(req.send_json(json!({ "title": title, "body": body })))?;
+        match status {
+            200 | 201 => read_json(&mut resp),
+            s => Err(api_status(s)),
+        }
+    }
+
+    /// `PUT /api/notes/:id` with only the fields that changed; returns the saved note.
+    pub fn update_note(&self, token: &str, id: &str, patch: &NotePatch) -> Result<Note, ApiError> {
+        let req = self.agent.put(self.url(&format!("/api/notes/{id}"))).header("Authorization", bearer(token));
+        let (status, mut resp) = self.send(req.send_json(patch))?;
+        match status {
+            200 => read_json(&mut resp),
+            s => Err(api_status(s)),
+        }
+    }
+
+    /// `DELETE /api/notes/:id`.
+    pub fn delete_note(&self, token: &str, id: &str) -> Result<(), ApiError> {
+        let req = self.agent.delete(self.url(&format!("/api/notes/{id}"))).header("Authorization", bearer(token));
         self.expect_ok(req.call())
     }
 

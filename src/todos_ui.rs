@@ -4,16 +4,17 @@
 use rune::{Cx, El, Icon, ScrollSpec, TextStyle, Tx, col, el, icon, row, text};
 use rune_kit::shell::{self, SidebarToggle};
 use rune_kit::{
-    Button, ButtonVariant, Checkbox, ControlSize, Dialog, IconButton, IconButtonVariant, Kit, MenuItem, Sidebar,
-    SidebarRow, SidebarSection, Spinner, SplitView, TextArea, TextInput, Toolbar, context_menu,
+    Button, ButtonVariant, Checkbox, ControlSize, Dialog, IconButton, IconButtonVariant, Kit, MenuItem,
+    SegmentedControl, Sidebar, SidebarRow, SidebarSection, Spinner, SplitView, TextArea, TextInput, Toolbar,
+    context_menu,
 };
 
 use crate::api::{Task, TaskList};
 use crate::session::Session;
 use crate::todos::{Event, Load};
-use crate::{App, MenuTarget, NEW_LIST};
+use crate::{App, MenuTarget, NEW_LIST, Section};
 
-static PLUS: Icon = Icon {
+pub(crate) static PLUS: Icon = Icon {
     name: "todo-plus",
     view: 16.0,
     body: r#"<path d="M8 3.5V12.5M3.5 8H12.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"#,
@@ -23,7 +24,7 @@ static LIST: Icon = Icon {
     view: 16.0,
     body: r#"<circle cx="3.75" cy="4.5" r="0.9" fill="currentColor"/><circle cx="3.75" cy="8" r="0.9" fill="currentColor"/><circle cx="3.75" cy="11.5" r="0.9" fill="currentColor"/><path d="M6.5 4.5H12.75M6.5 8H12.75M6.5 11.5H12.75" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>"#,
 };
-static NOTE: Icon = Icon {
+pub(crate) static NOTE: Icon = Icon {
     name: "todo-note",
     view: 16.0,
     body: r#"<path d="M4 3H12V13H4Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/><path d="M6 6H10M6 8.5H10M6 11H8.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>"#,
@@ -32,6 +33,31 @@ static NOTE: Icon = Icon {
 /// The signed-in screen and its overlays (menus, the delete confirmation).
 pub fn view(s: &App, session: &Session, k: &Kit, cx: &mut Cx<App>) -> El {
     let mut layer = Vec::new();
+    let split = match s.section {
+        Section::Tasks => tasks_split(s, session, k, cx, &mut layer),
+        Section::Notes => crate::notes_ui::split(s, session, k, cx, &mut layer),
+    };
+    confirm_delete(s, k, &mut layer);
+    rune_kit::root(split, layer)
+}
+
+/// The sidebar's frame, the same in both sections: the brand, the Tasks/Notes switch and the
+/// account row. Each section adds its "New" row and its rows.
+pub(crate) fn sidebar_frame(s: &App, session: &Session, k: &Kit) -> Sidebar {
+    let pick = SegmentedControl::new(&["Tasks", "Notes"], Some(usize::from(s.section == Section::Notes)))
+        .label("Section")
+        .width(None)
+        .on_pick(|s: &mut App, i, _: &mut Tx| s.set_section(if i == 0 { Section::Tasks } else { Section::Notes }))
+        .build(k)
+        .key("section");
+    Sidebar::new()
+        .header_padding(4.0, 8.0)
+        .header(brand(k))
+        .header(row().key("section-row").w_full().px(4.0).pb(8.0).child(pick))
+        .footer(account(session, k))
+}
+
+fn tasks_split(s: &App, session: &Session, k: &Kit, cx: &mut Cx<App>, layer: &mut Vec<El>) -> El {
     let title = s.todos.selected_list().map_or("Todo & Notes", |l| l.title.as_str());
     let toolbar = Toolbar::new().title(title).trailing(
         IconButton::new(&shell::INSPECTOR)
@@ -44,8 +70,8 @@ pub fn view(s: &App, session: &Session, k: &Kit, cx: &mut Cx<App>) -> El {
             .build(k)
             .key("details-toggle"),
     );
-    let split = SplitView::new(main_pane(s, k, &mut layer))
-        .sidebar(&s.sidebar, |s: &mut App| &mut s.sidebar, sidebar(s, session, k, &mut layer))
+    SplitView::new(main_pane(s, k, layer))
+        .sidebar(&s.sidebar, |s: &mut App| &mut s.sidebar, sidebar(s, session, k, layer))
         .inspector(&s.details, |s: &mut App| &mut s.details, details(s, k))
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
@@ -54,9 +80,7 @@ pub fn view(s: &App, session: &Session, k: &Kit, cx: &mut Cx<App>) -> El {
         .sidebar_padding(10.0, 10.0)
         .sidebar_toggle(SidebarToggle::new().in_header())
         .reduced_motion(cx.is_reduced_motion())
-        .build(k);
-    confirm_delete(s, k, &mut layer);
-    rune_kit::root(split, layer)
+        .build(k)
 }
 
 // The sidebar.
@@ -68,12 +92,7 @@ fn sidebar(s: &App, session: &Session, k: &Kit, layer: &mut Vec<El>) -> El {
         .on_select(|s: &mut App, tx: &mut Tx| s.start_new_list(tx))
         .build(k)
         .key("new-list");
-    let sb = Sidebar::new()
-        .label("Lists")
-        .header_padding(4.0, 8.0)
-        .header(brand(k))
-        .header(new_list)
-        .footer(account(session, k));
+    let sb = sidebar_frame(s, session, k).label("Lists").header(new_list);
     let sb = match &s.todos.lists {
         Load::Loading => sb.child(row().key("lists-loading").w_full().py(16.0).center().child(Spinner::new().build(k))),
         Load::Failed(e) => sb.child(
@@ -209,16 +228,16 @@ fn main_pane(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     };
     let mut pane = col().key("main").w_full().h_full().min_h(0.0);
     if let Some(n) = &s.todos.notice {
-        pane = pane.child(notice(n, k));
+        pane = pane.child(notice_bar(n, |s: &mut App| s.todo(Event::DismissNotice), k));
     }
     pane.child(body)
 }
 
-fn centered(e: El) -> El {
+pub(crate) fn centered(e: El) -> El {
     col().key("centered").w_full().grow(1.0).center().child(e)
 }
 
-fn empty_state(title: &str, detail: &str, action: Option<El>, k: &Kit) -> El {
+pub(crate) fn empty_state(title: &str, detail: &str, action: Option<El>, k: &Kit) -> El {
     let mut c = col()
         .key("empty")
         .gap(8.0)
@@ -235,7 +254,8 @@ fn retry(k: &Kit) -> El {
     Button::new("Try again").on_press(|s: &mut App| s.todo(Event::Reload)).build(k).key("retry")
 }
 
-fn notice(message: &str, k: &Kit) -> El {
+/// A failure message across the top of the main pane.
+pub(crate) fn notice_bar(message: &str, dismiss: impl Fn(&mut App) + 'static, k: &Kit) -> El {
     row()
         .key("notice")
         .w_full()
@@ -249,7 +269,7 @@ fn notice(message: &str, k: &Kit) -> El {
             Button::new("Dismiss")
                 .variant(ButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .on_press(|s: &mut App| s.todo(Event::DismissNotice))
+                .on_press(dismiss)
                 .build(k)
                 .key("dismiss"),
         )

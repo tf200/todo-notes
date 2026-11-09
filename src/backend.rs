@@ -156,6 +156,60 @@ mod live {
         assert!(rig.api.lists(&rig.token).unwrap().iter().all(|l| l.id != list));
         assert_eq!(rig.api.tasks(&rig.token, &list), Err(crate::api::ApiError::NotFound));
     }
+
+    #[test]
+    #[ignore = "needs the backend running and the dev account"]
+    fn a_note_typed_and_pinned_before_its_create_returns_is_saved() {
+        use crate::notes::{self, Event as N, Notes};
+        let base = std::env::var("TODO_API_URL").unwrap_or_else(|_| crate::api::DEFAULT_BASE_URL.into());
+        let api = Api::new(base);
+        let token = api
+            .login(&std::env::var("TODO_DEV_EMAIL").unwrap(), &std::env::var("TODO_DEV_PASSWORD").unwrap())
+            .expect("dev login");
+        let backend = Backend::start(api.clone(), Arc::new(|| {}));
+        let mut n = Notes::default();
+        let send = |n: &mut Notes, e: N| {
+            for fx in notes::step(n, e) {
+                if let Effect::Run(op) = fx {
+                    backend.run(0, &token, op);
+                }
+            }
+        };
+        let until = |n: &mut Notes, done: &dyn Fn(&Notes) -> bool| {
+            let start = Instant::now();
+            while !done(n) {
+                assert!(start.elapsed() < Duration::from_secs(15), "timed out: {n:?}");
+                match backend.take() {
+                    Some((_, r)) => {
+                        for fx in notes::step(n, N::Reply(r)) {
+                            if let Effect::Run(op) = fx {
+                                backend.run(0, &token, op);
+                            }
+                        }
+                    }
+                    None => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        };
+        send(&mut n, N::Open);
+        until(&mut n, &|n| matches!(n.notes, Load::Ready(_)));
+
+        send(&mut n, N::New);
+        let tmp = n.open.clone().unwrap();
+        send(&mut n, N::Edit { id: tmp.clone(), title: "E2E note".into(), body: "- [ ] one".into() });
+        send(&mut n, N::SetPinned { id: tmp, pinned: true });
+        until(&mut n, &|n| n.open.as_deref().is_some_and(|o| !is_temp(o)));
+        let id = n.open.clone().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+
+        let saved = api.notes(&token).unwrap().into_iter().find(|x| x.id == id).expect("on the server");
+        assert_eq!((saved.title.as_str(), saved.body.as_str(), saved.pinned), ("E2E note", "- [ ] one", true));
+        assert_eq!(n.notice, None);
+
+        send(&mut n, N::Delete(id.clone()));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(api.notes(&token).unwrap().iter().all(|x| x.id != id));
+    }
 }
 
 /// Carries out one request. `ids` maps temporary ids to the server's. Returns `None` for a
@@ -188,5 +242,15 @@ fn run(api: &Api, token: &str, op: Op, ids: &mut HashMap<String, String>) -> Opt
         }
         Op::UpdateTask { id: task, patch } => Reply::Saved(api.update_task(token, &id(ids, &task)?, &patch)),
         Op::DeleteTask { id: task } => Reply::Saved(api.delete_task(token, &id(ids, &task)?)),
+        Op::LoadNotes => Reply::Notes(api.notes(token)),
+        Op::CreateNote { tmp, title, body } => {
+            let result = api.create_note(token, &title, &body);
+            if let Ok(n) = &result {
+                ids.insert(tmp.clone(), n.id.clone());
+            }
+            Reply::NoteCreated { tmp, result }
+        }
+        Op::UpdateNote { id: note, patch } => Reply::NoteSaved(api.update_note(token, &id(ids, &note)?, &patch)),
+        Op::DeleteNote { id: note } => Reply::NoteDeleted(api.delete_note(token, &id(ids, &note)?)),
     })
 }

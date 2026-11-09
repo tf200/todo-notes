@@ -8,6 +8,8 @@ mod api;
 mod auth;
 mod backdrop;
 mod backend;
+mod notes;
+mod notes_ui;
 mod session;
 mod todos;
 mod todos_ui;
@@ -23,6 +25,7 @@ use api::{Api, ApiError, Me};
 use auth::{Auth, Effect, Event, Mode};
 use backend::Backend;
 use session::{Keyring, NoStore, TokenStore};
+use notes::Notes;
 use todos::Todos;
 
 /// What a context menu is open on.
@@ -30,6 +33,14 @@ use todos::Todos;
 pub enum MenuTarget {
     List(String),
     Task(String),
+    Note(String),
+}
+
+/// Which half of the app the window shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Section {
+    Tasks,
+    Notes,
 }
 
 pub struct App {
@@ -71,6 +82,16 @@ pub struct App {
     pub menu: Option<(MenuTarget, PointerPress)>,
     /// A list waiting on the delete confirmation.
     pub confirm_delete: Option<String>,
+
+    // The notes screen.
+    pub section: Section,
+    pub notes: Notes,
+    /// The editor's fields, holding the note `note_loaded`.
+    pub note_title: TextEdit,
+    pub note_body: TextEdit,
+    note_loaded: Option<String>,
+    /// The editor shows the rendered Markdown instead of the source.
+    pub note_preview: bool,
 }
 
 /// Seconds after the last keystroke before an edit saves itself.
@@ -129,7 +150,116 @@ impl App {
         self.confirm_delete = None;
         self.new_task.replace_text("");
         self.details.set_open(false);
+        self.section = Section::Tasks;
+        self.note_loaded = None;
+        self.note_preview = false;
         self.todo(todos::Event::Open);
+        self.note(notes::Event::Open);
+    }
+
+    /// Steps the notes model, queues its requests, and keeps the editor on the open note.
+    pub fn note(&mut self, event: notes::Event) {
+        use notes::Event as N;
+        // Events that can change which note is open: save the editor's text first, so
+        // nothing typed is dropped when the fields reload.
+        let moves = matches!(event, N::Select(_) | N::New | N::Delete(_) | N::Reply(todos::Reply::Notes(_)));
+        if moves {
+            self.save_open_note();
+        }
+        // The server named a new note: the editor keeps its fields (and the caret) on it.
+        if let N::Reply(todos::Reply::NoteCreated { tmp, result: Ok(saved) }) = &event {
+            if self.note_loaded.as_ref() == Some(tmp) && self.notes.open.as_ref() == Some(tmp) {
+                self.note_loaded = Some(saved.id.clone());
+            }
+        }
+        for effect in notes::step(&mut self.notes, event) {
+            match effect {
+                todos::Effect::Run(op) => {
+                    if let (Some(b), Some(token)) = (&self.backend, self.token()) {
+                        b.run(self.todos.epoch, token, op);
+                    }
+                }
+                todos::Effect::Unauthorized => self.dispatch(Event::Unauthorized),
+            }
+        }
+        if self.notes.open != self.note_loaded {
+            let (title, body) =
+                self.notes.open_note().map(|n| (n.title.clone(), n.body.clone())).unwrap_or_default();
+            self.note_title = TextEdit::new(title);
+            self.note_body = TextEdit::new(body);
+            self.note_loaded = self.notes.open.clone();
+        }
+    }
+
+    pub fn set_section(&mut self, section: Section) {
+        if self.section == section {
+            return;
+        }
+        self.save_open_task();
+        self.save_open_note();
+        self.menu = None;
+        self.renaming = None;
+        self.section = section;
+    }
+
+    /// Whether the editor's fields differ from the saved note.
+    pub fn note_edited(&self) -> bool {
+        let Some(note) = self.note_loaded.as_ref().and_then(|id| self.notes.get(id)) else { return false };
+        self.note_title.text != note.title || self.note_body.text != note.body
+    }
+
+    pub fn save_open_note(&mut self) {
+        if !self.note_edited() {
+            return;
+        }
+        if let Some(id) = self.note_loaded.clone() {
+            // Straight to the model: `note` would save again before stepping.
+            let event =
+                notes::Event::Edit { id, title: self.note_title.text.clone(), body: self.note_body.text.clone() };
+            for effect in notes::step(&mut self.notes, event) {
+                if let (todos::Effect::Run(op), Some(b), Some(token)) = (effect, &self.backend, self.token()) {
+                    b.run(self.todos.epoch, token, op);
+                }
+            }
+        }
+    }
+
+    /// Leaves the open note, deleting it when nothing was ever written in it.
+    fn leave_note(&mut self) {
+        self.save_open_note();
+        let empty = self.notes.open_note().filter(|n| n.title.trim().is_empty() && n.body.trim().is_empty());
+        if let Some(id) = empty.map(|n| n.id.clone()) {
+            self.note(notes::Event::Delete(id));
+        }
+    }
+
+    pub fn open_note(&mut self, id: String) {
+        if self.notes.open.as_ref() == Some(&id) {
+            return;
+        }
+        self.leave_note();
+        self.note(notes::Event::Select(id));
+    }
+
+    pub fn new_note(&mut self, tx: &mut Tx) {
+        self.set_section(Section::Notes);
+        // An empty note is already open: reuse it.
+        if self.notes.open_note().is_some_and(|n| n.title.is_empty() && n.body.is_empty()) && !self.note_edited() {
+            tx.focus("note-title", false);
+            return;
+        }
+        self.leave_note();
+        self.note(notes::Event::New);
+        self.note_preview = false;
+        tx.focus("note-title", false);
+    }
+
+    /// A task box in the Markdown preview was clicked: flip its marker and save.
+    pub fn toggle_note_task(&mut self, offset: usize, checked: bool) {
+        if let Some(body) = notes::toggle_task(&self.note_body.text, offset, checked) {
+            self.note_body = TextEdit::new(body);
+            self.save_open_note();
+        }
     }
 
     /// Steps the todo model and queues the requests it asks for.
@@ -164,6 +294,7 @@ impl App {
 
     pub fn sign_out(&mut self, tx: &mut Tx) {
         self.save_open_task();
+        self.save_open_note();
         self.dispatch(Event::SignOut);
         tx.focus("email", false);
     }
@@ -293,6 +424,12 @@ fn init() -> App {
         show_done: true,
         menu: None,
         confirm_delete: None,
+        section: Section::Tasks,
+        notes: Notes::default(),
+        note_title: TextEdit::new(""),
+        note_body: TextEdit::new(""),
+        note_loaded: None,
+        note_preview: false,
     }
 }
 
@@ -321,12 +458,17 @@ fn poll(s: &mut App, now: f64, _tx: &mut Tx) -> bool {
     }
     if s.save_due.is_some_and(|due| now >= due) {
         s.save_open_task();
+        s.save_open_note();
         changed = true;
     }
     while let Some((epoch, reply)) = s.backend.as_ref().and_then(Backend::take) {
         // Replies for an earlier sign-in are dropped.
         if epoch == s.todos.epoch && s.signed_in() {
-            s.todo(todos::Event::Reply(reply));
+            if reply.is_note() {
+                s.note(notes::Event::Reply(reply));
+            } else {
+                s.todo(todos::Event::Reply(reply));
+            }
         }
         changed = true;
     }
@@ -338,11 +480,16 @@ fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         return false;
     }
     if ev.is_command('n') {
-        if ev.mods.shift {
-            s.start_new_list(tx);
-        } else {
-            tx.focus("new-task", false);
+        match (s.section, ev.mods.shift) {
+            (Section::Notes, _) => s.new_note(tx),
+            (Section::Tasks, true) => s.start_new_list(tx),
+            (Section::Tasks, false) => tx.focus("new-task", false),
         }
+        return true;
+    }
+    // Ctrl+1 and Ctrl+2 switch between tasks and notes.
+    if ev.is_command('1') || ev.is_command('2') {
+        s.set_section(if ev.is_command('1') { Section::Tasks } else { Section::Notes });
         return true;
     }
     if rune_kit::shell::is_sidebar_toggle(ev) {
@@ -365,6 +512,7 @@ fn main() {
     })
     .on_close(|s, _| {
         s.save_open_task();
+        s.save_open_note();
         // Let queued saves reach the server before the process ends.
         if let Some(b) = &mut s.backend {
             b.finish(std::time::Duration::from_secs(3));

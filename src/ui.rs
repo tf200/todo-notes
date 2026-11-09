@@ -180,6 +180,36 @@ fn checking(k: &Kit) -> El {
         .child(text("Signing you in…").font(k.ty.ui).color(k.c.text_muted))
 }
 
+/// Signs a scene in with sample notes, the first open.
+fn sample_notes(s: &mut App, preview: bool) {
+    use crate::api::Note;
+    sample_todos(s, 0);
+    s.section = crate::Section::Notes;
+    let note = |id: &str, title: &str, body: &str, pinned: bool, day: &str| Note {
+        id: id.into(),
+        title: title.into(),
+        body: body.into(),
+        pinned,
+        created_at: format!("2026-11-{day}T09:00:00Z"),
+        updated_at: format!("2026-11-{day}T09:00:00Z"),
+    };
+    let notes = vec![
+        note(
+            "n1",
+            "Trip packing list",
+            "## Clothes\n- [x] Rain jacket\n- [ ] Hiking boots\n- [ ] Two warm layers\n\n## Gear\n- [ ] Headlamp and spare batteries\n- [x] First-aid kit\n\n> Check the cabin has bedding before packing sleeping bags.",
+            false,
+            "08",
+        ),
+        note("n2", "Book ideas", "A story told entirely through **grocery lists** left on a fridge.", false, "06"),
+        note("n3", "Meeting notes: Q4 planning", "Agreed to ship notes before the holidays.\n\n1. Notes backend\n2. Notes UI\n3. Sync", false, "03"),
+        note("n4", "Wi-Fi and door codes", "Studio: `studio-5g`\nGate: ask Sam", true, "01"),
+    ];
+    s.note(crate::notes::Event::Reply(crate::todos::Reply::Notes(Ok(notes))));
+    s.note(crate::notes::Event::Select("n1".into()));
+    s.note_preview = preview;
+}
+
 /// Signs a scene in with sample lists, without a server.
 fn sample_todos(s: &mut App, list: usize) {
     use crate::api::{Task, TaskList};
@@ -263,6 +293,13 @@ pub const SCENES: &[(&str, fn(&mut App))] = &[
     ("todos-notice", |s| {
         sample_todos(s, 1);
         s.todos.notice = Some("Couldn't save your change. Can't reach the server.".into());
+    }),
+    ("notes", |s| sample_notes(s, false)),
+    ("notes-preview", |s| sample_notes(s, true)),
+    ("notes-none", |s| {
+        sample_todos(s, 0);
+        s.section = crate::Section::Notes;
+        s.note(crate::notes::Event::Reply(crate::todos::Reply::Notes(Ok(vec![]))));
     }),
     ("todos-none", |s| {
         sample_todos(s, 0);
