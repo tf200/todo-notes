@@ -64,11 +64,17 @@ pub struct App {
     /// The details pane's fields, for `todos.open_task`.
     pub task_title: TextEdit,
     pub task_notes: TextEdit,
+    /// When the details pane's edits save by themselves (window clock seconds): a short pause
+    /// after the last keystroke.
+    pub save_due: Option<f64>,
     pub show_done: bool,
     pub menu: Option<(MenuTarget, PointerPress)>,
     /// A list waiting on the delete confirmation.
     pub confirm_delete: Option<String>,
 }
+
+/// Seconds after the last keystroke before an edit saves itself.
+pub const AUTOSAVE_PAUSE: f64 = 0.8;
 
 /// `renaming` for the draft row of a list being created.
 pub const NEW_LIST: &str = "new-list";
@@ -201,7 +207,15 @@ impl App {
         (!title.is_empty() && title != task.title) || self.task_notes.text != task.description
     }
 
+    /// A details field changed: save once typing pauses.
+    pub fn edited_task(&mut self, tx: &mut Tx) {
+        let due = tx.clock() + AUTOSAVE_PAUSE;
+        self.save_due = Some(due);
+        tx.wake_at(due);
+    }
+
     pub fn save_open_task(&mut self) {
+        self.save_due = None;
         if !self.task_edited() {
             return;
         }
@@ -275,6 +289,7 @@ fn init() -> App {
         rename: TextEdit::new(""),
         task_title: TextEdit::new(""),
         task_notes: TextEdit::new(""),
+        save_due: None,
         show_done: true,
         menu: None,
         confirm_delete: None,
@@ -302,6 +317,10 @@ fn poll(s: &mut App, now: f64, _tx: &mut Tx) -> bool {
     }
     if let Some((attempt, result)) = s.checked.take() {
         s.dispatch(Event::Checked { attempt, result });
+        changed = true;
+    }
+    if s.save_due.is_some_and(|due| now >= due) {
+        s.save_open_task();
         changed = true;
     }
     while let Some((epoch, reply)) = s.backend.as_ref().and_then(Backend::take) {
@@ -346,6 +365,10 @@ fn main() {
     })
     .on_close(|s, _| {
         s.save_open_task();
+        // Let queued saves reach the server before the process ends.
+        if let Some(b) = &mut s.backend {
+            b.finish(std::time::Duration::from_secs(3));
+        }
         s.sent.cancel();
         s.checked.cancel();
     })

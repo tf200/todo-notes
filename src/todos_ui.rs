@@ -436,6 +436,7 @@ fn details(s: &App, k: &Kit) -> El {
     let title = TextInput::new(&s.task_title)
         .width(None)
         .on_edit(|s: &mut App| &mut s.task_title)
+        .on_change(|s: &mut App, tx: &mut Tx| s.edited_task(tx))
         .on_submit(|s: &mut App, _: &mut Tx| s.save_open_task())
         .build(k)
         .key("task-title");
@@ -444,6 +445,7 @@ fn details(s: &App, k: &Kit) -> El {
         .width(None)
         .auto_grow(5, 16)
         .on_edit(|s: &mut App| &mut s.task_notes)
+        .on_change(|s: &mut App, tx: &mut Tx| s.edited_task(tx))
         .build(k)
         .key("task-notes");
     let done_box = Checkbox::new(done)
@@ -458,13 +460,13 @@ fn details(s: &App, k: &Kit) -> El {
         .key("task-actions")
         .w_full()
         .gap(8.0)
+        .center_y()
         .child(
-            Button::new("Save")
-                .variant(ButtonVariant::Submit)
-                .disabled(!s.task_edited())
-                .on_press(|s: &mut App| s.save_open_task())
-                .build(k)
-                .key("task-save"),
+            // Edits save by themselves a moment after typing stops.
+            text(if s.task_edited() { "Editing…" } else { "Saved" })
+                .key("task-saved")
+                .font(k.ty.small)
+                .color(k.c.text_faint),
         )
         .child(el().grow(1.0))
         .child(

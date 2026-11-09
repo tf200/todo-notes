@@ -14,8 +14,11 @@ use crate::api::Api;
 use crate::todos::{Op, Reply, is_temp};
 
 pub struct Backend {
-    send: Sender<Job>,
+    /// `None` once [`Backend::finish`] has closed the queue.
+    send: Option<Sender<Job>>,
     replies: Receiver<(u64, Reply)>,
+    /// Signalled when the worker has run every queued request and stopped.
+    stopped: Receiver<()>,
 }
 
 struct Job {
@@ -29,27 +32,38 @@ impl Backend {
     pub fn start(api: Api, waker: Waker) -> Backend {
         let (send, jobs) = channel::<Job>();
         let (reply, replies) = channel();
+        let (stop, stopped) = channel();
         std::thread::Builder::new()
             .name("todo-backend".into())
             .spawn(move || {
                 let mut ids = HashMap::new();
-                // Ends when the app drops its `Backend` (the window closed).
+                // Ends when the queue closes: `finish`, or the app dropping its `Backend`.
                 for job in jobs {
                     if let Some(r) = run(&api, &job.token, job.op, &mut ids) {
-                        if reply.send((job.epoch, r)).is_err() {
-                            break;
+                        // The app may be gone (closing); keep going so queued saves still land.
+                        if reply.send((job.epoch, r)).is_ok() {
+                            waker();
                         }
-                        waker();
                     }
                 }
+                let _ = stop.send(());
             })
             .expect("spawn the backend thread");
-        Backend { send, replies }
+        Backend { send: Some(send), replies, stopped }
     }
 
     /// Queues `op`, tagged with the sign-in it belongs to.
     pub fn run(&self, epoch: u64, token: &str, op: Op) {
-        let _ = self.send.send(Job { epoch, token: token.to_string(), op });
+        if let Some(send) = &self.send {
+            let _ = send.send(Job { epoch, token: token.to_string(), op });
+        }
+    }
+
+    /// Closes the queue and waits, up to `limit`, for the requests already in it to reach the
+    /// server: the window is closing and the last edits shouldn't be lost.
+    pub fn finish(&mut self, limit: std::time::Duration) {
+        self.send = None;
+        let _ = self.stopped.recv_timeout(limit);
     }
 
     /// The next finished request, if any.
