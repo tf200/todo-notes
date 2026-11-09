@@ -105,6 +105,8 @@ pub enum Event {
     /// A task at the end of the selected list.
     AddTask(String),
     SetDone { id: String, done: bool },
+    /// Sets the day a task is due (a `due_at` stamp), or removes it.
+    SetDue { id: String, due: Option<String> },
     /// Saves the details pane's title and description.
     EditTask { id: String, title: String, description: String },
     DeleteTask(String),
@@ -298,6 +300,15 @@ pub fn step(t: &mut Todos, event: Event) -> Vec<Effect> {
             }
             task.done = done;
             fx.push(Effect::Run(Op::UpdateTask { id, patch: TaskPatch { done: Some(done), ..TaskPatch::default() } }));
+        }
+        Event::SetDue { id, due } => {
+            let Some(task) = t.task_mut(&id) else { return fx };
+            let day = |d: &Option<String>| d.as_deref().and_then(|d| d.get(..10)).map(str::to_owned);
+            if day(&task.due_at) == day(&due) {
+                return fx;
+            }
+            task.due_at = due.clone();
+            fx.push(Effect::Run(Op::UpdateTask { id, patch: TaskPatch { due_at: Some(due), ..TaskPatch::default() } }));
         }
         Event::EditTask { id, title, description } => {
             let title = title.trim().to_string();

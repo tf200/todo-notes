@@ -228,6 +228,19 @@ fn sample_todos(s: &mut App, list: usize) {
         ("t7", "l2", "Write the release notes", false, ""),
         ("t8", "l3", "Book the cabin", true, ""),
     ];
+    // Due days around today, so the labels read the same whenever the scene is taken.
+    let today = s.today;
+    let due = move |id: &str| {
+        let day = match id {
+            "t1" => today.pred_opt()?,
+            "t3" => today,
+            "t6" => crate::dates::add_days(today, 1),
+            "t7" => crate::dates::add_days(today, 4),
+            "t2" => crate::dates::add_days(today, 12),
+            _ => return None,
+        };
+        Some(crate::dates::stamp(day))
+    };
     step(&mut s.todos, T::Open);
     let to_list = |(id, title): &(&str, &str)| TaskList {
         id: id.to_string(),
@@ -244,7 +257,7 @@ fn sample_todos(s: &mut App, list: usize) {
                 list_id: l.into(),
                 title: title.into(),
                 description: notes.into(),
-                due_at: (id == "t7").then(|| "2026-11-14T00:00:00Z".to_string()),
+                due_at: due(id),
                 done,
                 created_at: "2026-11-02T10:00:00Z".into(),
             })
@@ -284,6 +297,16 @@ pub const SCENES: &[(&str, fn(&mut App))] = &[
     ("todos-details", |s| {
         sample_todos(s, 0);
         s.open_task("t2".into());
+    }),
+    ("todos-due-picker", |s| {
+        sample_todos(s, 0);
+        s.open_task("t2".into());
+        s.toggle_due_picker();
+    }),
+    ("todos-due-empty", |s| {
+        sample_todos(s, 0);
+        s.open_task("t4".into());
+        s.toggle_due_picker();
     }),
     ("todos-empty-list", |s| sample_todos(s, 3)),
     ("todos-delete", |s| {

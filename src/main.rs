@@ -8,6 +8,7 @@ mod api;
 mod auth;
 mod backdrop;
 mod backend;
+mod dates;
 mod notes;
 mod notes_ui;
 mod session;
@@ -79,6 +80,10 @@ pub struct App {
     /// after the last keystroke.
     pub save_due: Option<f64>,
     pub show_done: bool,
+    /// The user's local date, for due labels; kept current by `poll`.
+    pub today: chrono::NaiveDate,
+    /// The details pane's due-date picker, open on this month.
+    pub due_picker: Option<chrono::NaiveDate>,
     pub menu: Option<(MenuTarget, PointerPress)>,
     /// A list waiting on the delete confirmation.
     pub confirm_delete: Option<String>,
@@ -321,8 +326,24 @@ impl App {
         let Some(task) = self.todos.task(&id) else { return };
         self.task_title = TextEdit::new(task.title.clone());
         self.task_notes = TextEdit::new(task.description.clone());
+        self.due_picker = None;
         self.todo(todos::Event::OpenTask(Some(id)));
         self.details.set_open(true);
+    }
+
+    /// Sets or removes a task's due day, closing the picker.
+    pub fn set_due(&mut self, id: String, day: Option<chrono::NaiveDate>) {
+        self.due_picker = None;
+        self.todo(todos::Event::SetDue { id, due: day.map(dates::stamp) });
+    }
+
+    /// Opens the due-date picker on the task's month (this month when it has none), or closes it.
+    pub fn toggle_due_picker(&mut self) {
+        if self.due_picker.take().is_some() {
+            return;
+        }
+        let due = self.todos.open_task.as_deref().and_then(|id| self.todos.task(id)?.due_at.as_deref().and_then(dates::parse));
+        self.due_picker = Some(dates::month_of(due.unwrap_or(self.today)));
     }
 
     pub fn close_task(&mut self) {
@@ -422,6 +443,8 @@ fn init() -> App {
         task_notes: TextEdit::new(""),
         save_due: None,
         show_done: true,
+        today: dates::today(),
+        due_picker: None,
         menu: None,
         confirm_delete: None,
         section: Section::Tasks,
@@ -454,6 +477,12 @@ fn poll(s: &mut App, now: f64, _tx: &mut Tx) -> bool {
     }
     if let Some((attempt, result)) = s.checked.take() {
         s.dispatch(Event::Checked { attempt, result });
+        changed = true;
+    }
+    // Due labels say "Today": follow the date past midnight.
+    let today = dates::today();
+    if today != s.today {
+        s.today = today;
         changed = true;
     }
     if s.save_due.is_some_and(|due| now >= due) {

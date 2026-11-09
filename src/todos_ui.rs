@@ -4,12 +4,13 @@
 use rune::{Cx, El, Icon, ScrollSpec, TextStyle, Tx, col, el, icon, row, text};
 use rune_kit::shell::{self, SidebarToggle};
 use rune_kit::{
-    Button, ButtonVariant, Checkbox, ControlSize, Dialog, IconButton, IconButtonVariant, Kit, MenuItem,
-    SegmentedControl, Sidebar, SidebarRow, SidebarSection, Spinner, SplitView, TextArea, TextInput, Toolbar,
+    Button, ButtonVariant, Checkbox, ControlSize, Dialog, IconButton, IconButtonVariant, Kit, MenuItem, Placement,
+    Popover, SegmentedControl, Sidebar, SidebarRow, SidebarSection, Spinner, SplitView, TextArea, TextInput, Toolbar,
     context_menu,
 };
 
 use crate::api::{Task, TaskList};
+use crate::dates;
 use crate::session::Session;
 use crate::todos::{Event, Load};
 use crate::{App, MenuTarget, NEW_LIST, Section};
@@ -28,6 +29,21 @@ pub(crate) static NOTE: Icon = Icon {
     name: "todo-note",
     view: 16.0,
     body: r#"<path d="M4 3H12V13H4Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/><path d="M6 6H10M6 8.5H10M6 11H8.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>"#,
+};
+static CALENDAR: Icon = Icon {
+    name: "todo-calendar",
+    view: 16.0,
+    body: r#"<rect x="2.75" y="3.5" width="10.5" height="9.75" rx="1.75" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M2.75 6.75H13.25M5.5 2.25V4.5M10.5 2.25V4.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>"#,
+};
+static PREV: Icon = Icon {
+    name: "todo-prev",
+    view: 16.0,
+    body: r#"<path d="M9.75 4L5.75 8L9.75 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+static NEXT: Icon = Icon {
+    name: "todo-next",
+    view: 16.0,
+    body: r#"<path d="M6.25 4L10.25 8L6.25 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
 };
 
 /// The signed-in screen and its overlays (menus, the delete confirmation).
@@ -72,7 +88,7 @@ fn tasks_split(s: &App, session: &Session, k: &Kit, cx: &mut Cx<App>, layer: &mu
     );
     SplitView::new(main_pane(s, k, layer))
         .sidebar(&s.sidebar, |s: &mut App| &mut s.sidebar, sidebar(s, session, k, layer))
-        .inspector(&s.details, |s: &mut App| &mut s.details, details(s, k))
+        .inspector(&s.details, |s: &mut App| &mut s.details, details(s, k, layer))
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
         .frame_inset(8.0)
@@ -398,8 +414,23 @@ fn task_row(s: &App, t: &Task, k: &Kit, layer: &mut Vec<El>) -> El {
     if !t.description.trim().is_empty() {
         r = r.child(icon(&NOTE, 14.0).key("has-notes").color(k.c.text_faint).ml(12.0));
     }
-    if let Some(due) = t.due_at.as_deref().and_then(|d| d.get(..10)) {
-        r = r.child(text(format!("Due {due}")).key("due").font(k.ty.small).color(k.c.text_muted).ml(12.0));
+    if let Some(day) = t.due_at.as_deref().and_then(dates::parse) {
+        // Overdue reads in red until it's done; due today in the accent colour.
+        let color = match day.cmp(&s.today) {
+            _ if done => k.c.text_faint,
+            std::cmp::Ordering::Less => k.c.danger.fg,
+            std::cmp::Ordering::Equal => k.c.text_accent,
+            std::cmp::Ordering::Greater => k.c.text_muted,
+        };
+        r = r.child(
+            row()
+                .key("due")
+                .gap(4.0)
+                .center_y()
+                .ml(12.0)
+                .child(icon(&CALENDAR, 13.0).color(color))
+                .child(text(dates::label(day, s.today)).font(k.ty.small).color(color)),
+        );
     }
     // A light wash, so the checkbox's outline still shows on the open row.
     let wash = k.c.text_base.alpha(if k.dark { 0.06 } else { 0.05 });
@@ -417,7 +448,8 @@ fn task_row(s: &App, t: &Task, k: &Kit, layer: &mut Vec<El>) -> El {
         Some((MenuTarget::Task(m), p)) if *m == t.id => Some(*p),
         _ => None,
     };
-    context_menu(format!("task-menu-{id}"), r, point)
+    let has_due = t.due_at.is_some();
+    let menu = context_menu(format!("task-menu-{id}"), r, point)
         .item(MenuItem::new("Open details").on_select({
             let id = id.clone();
             move |s: &mut App| {
@@ -432,6 +464,40 @@ fn task_row(s: &App, t: &Task, k: &Kit, layer: &mut Vec<El>) -> El {
                 s.todo(Event::SetDone { id: id.clone(), done: !done });
             }
         }))
+        .separator()
+        .item(MenuItem::new("Due today").icon(&CALENDAR).on_select({
+            let id = id.clone();
+            move |s: &mut App| {
+                s.menu = None;
+                s.set_due(id.clone(), Some(s.today));
+            }
+        }))
+        .item(MenuItem::new("Due tomorrow").on_select({
+            let id = id.clone();
+            move |s: &mut App| {
+                s.menu = None;
+                s.set_due(id.clone(), Some(dates::add_days(s.today, 1)));
+            }
+        }))
+        .item(MenuItem::new("Due next week").on_select({
+            let id = id.clone();
+            move |s: &mut App| {
+                s.menu = None;
+                s.set_due(id.clone(), Some(dates::next_week(s.today)));
+            }
+        }));
+    let menu = if has_due {
+        menu.item(MenuItem::new("Remove due date").on_select({
+            let id = id.clone();
+            move |s: &mut App| {
+                s.menu = None;
+                s.set_due(id.clone(), None);
+            }
+        }))
+    } else {
+        menu
+    };
+    menu.separator()
         .item(MenuItem::new("Delete task").danger(true).on_select(move |s: &mut App| {
             s.menu = None;
             s.todo(Event::DeleteTask(id.clone()));
@@ -443,7 +509,7 @@ fn task_row(s: &App, t: &Task, k: &Kit, layer: &mut Vec<El>) -> El {
 
 // The details pane.
 
-fn details(s: &App, k: &Kit) -> El {
+fn details(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let pane = col().key("details").w_full().padding(16.0).gap(16.0);
     let Some(task) = s.todos.open_task.as_ref().and_then(|id| s.todos.task(id)) else {
         return pane.child(
@@ -501,6 +567,7 @@ fn details(s: &App, k: &Kit) -> El {
         );
     let mut pane = pane
         .child(col().gap(6.0).child(label("Title")).child(title))
+        .child(col().gap(6.0).child(label("Due")).child(due_picker(s, task, k, layer)))
         .child(col().gap(6.0).child(label("Notes")).child(notes))
         .child(done_box)
         .child(actions);
@@ -508,6 +575,110 @@ fn details(s: &App, k: &Kit) -> El {
         pane = pane.child(text(format!("Created {day}")).font(k.ty.small).color(k.c.text_faint));
     }
     pane
+}
+
+/// The due-date button, and the picker it opens: quick days, a month, and "Remove".
+fn due_picker(s: &App, task: &Task, k: &Kit, layer: &mut Vec<El>) -> El {
+    let due = task.due_at.as_deref().and_then(dates::parse);
+    let trigger = Button::new(due.map_or_else(|| "Add a due date".to_string(), |d| dates::long_label(d, s.today)))
+        .variant(if due.is_some() { ButtonVariant::Neutral } else { ButtonVariant::GhostMuted })
+        .icon(&CALENDAR)
+        .expanded(s.due_picker.is_some())
+        .on_press(|s: &mut App| s.toggle_due_picker())
+        .build(k)
+        .key("due-button");
+    let mut pop = Popover::new("due-picker")
+        .trigger(trigger)
+        .label("Due date")
+        .placement(Placement::BottomStart)
+        .open(s.due_picker.is_some())
+        .on_close(|s: &mut App| s.due_picker = None);
+    if let Some(month) = s.due_picker {
+        pop = pop.child(calendar(s, &task.id, due, month, k));
+    }
+    row().key("due-row").child(pop.build(k, layer))
+}
+
+fn calendar(s: &App, id: &str, due: Option<chrono::NaiveDate>, month: chrono::NaiveDate, k: &Kit) -> El {
+    use chrono::Datelike;
+    const CELL: f32 = 34.0;
+    let pick = |label: &str, key: &str, day: chrono::NaiveDate| {
+        let id = id.to_string();
+        Button::new(label)
+            .control_size(ControlSize::Small)
+            .on_press(move |s: &mut App| s.set_due(id.clone(), Some(day)))
+            .build(k)
+            .key(key.to_string())
+    };
+    let quick = row()
+        .key("due-quick")
+        .gap(6.0)
+        .child(pick("Today", "due-today", s.today))
+        .child(pick("Tomorrow", "due-tomorrow", dates::add_days(s.today, 1)))
+        .child(pick("Next week", "due-next-week", dates::next_week(s.today)));
+    let nav = |glyph: &'static Icon, label: &str, key: &str, by: i32| {
+        IconButton::new(glyph)
+            .label(label)
+            .variant(IconButtonVariant::Ghost)
+            .control_size(ControlSize::Small)
+            .on_press(move |s: &mut App| s.due_picker = s.due_picker.map(|m| dates::shift_month(m, by)))
+            .build(k)
+            .key(key.to_string())
+    };
+    let header = row()
+        .key("due-month")
+        .w_full()
+        .center_y()
+        .child(text(month.format("%B %Y").to_string()).font(k.ty.ui_medium).color(k.c.text_base).grow(1.0).pl(4.0))
+        .child(nav(&PREV, "Previous month", "due-prev", -1))
+        .child(nav(&NEXT, "Next month", "due-next", 1));
+    let weekdays = row().key("due-weekdays").gap(2.0).children(dates::WEEKDAYS.iter().map(|w| {
+        row()
+            .key(format!("{w}"))
+            .w(CELL)
+            .center()
+            .child(text(w.to_string()[..2].to_string()).font(k.ty.small).color(k.c.text_faint))
+    }));
+    let mut grid = col().key("due-grid").gap(2.0).child(weekdays);
+    for (i, week) in dates::weeks(month).into_iter().enumerate() {
+        let mut r = row().key(format!("week-{i}")).gap(2.0);
+        for (j, day) in week.into_iter().enumerate() {
+            r = r.child(match day {
+                None => el().key(format!("blank-{j}")).w(CELL).h(28.0),
+                Some(day) => {
+                    let variant = if Some(day) == due {
+                        ButtonVariant::Submit
+                    } else if day == s.today {
+                        ButtonVariant::Outline
+                    } else {
+                        ButtonVariant::Ghost
+                    };
+                    let id = id.to_string();
+                    Button::new(day.day().to_string())
+                        .variant(variant)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut App| s.set_due(id.clone(), Some(day)))
+                        .build(k)
+                        .key(format!("day-{}", day.day()))
+                        .w(CELL)
+                }
+            });
+        }
+        grid = grid.child(r);
+    }
+    let mut c = col().key("due-calendar").gap(10.0).child(quick).child(header).child(grid);
+    if due.is_some() {
+        let id = id.to_string();
+        c = c.child(
+            Button::new("Remove due date")
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut App| s.set_due(id.clone(), None))
+                .build(k)
+                .key("due-remove"),
+        );
+    }
+    c
 }
 
 // The delete confirmation.

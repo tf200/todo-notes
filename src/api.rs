@@ -82,6 +82,9 @@ pub struct TaskPatch {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub done: Option<bool>,
+    /// `Some(None)` sends `"due_at": null`, which removes the due date.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<Option<String>>,
 }
 
 /// A note (`/api/notes`). The body is Markdown.

@@ -145,6 +145,29 @@ fn toggling_sends_only_done() {
 }
 
 #[test]
+fn setting_and_clearing_a_due_date() {
+    let mut t = loaded();
+    let due = |d: Option<&str>| Event::SetDue { id: "t1".into(), due: d.map(Into::into) };
+    let fx = step(&mut t, due(Some("2026-11-14T00:00:00Z")));
+    let patch = TaskPatch { due_at: Some(Some("2026-11-14T00:00:00Z".into())), ..Default::default() };
+    assert_eq!(fx, vec![run(Op::UpdateTask { id: "t1".into(), patch })]);
+    assert_eq!(t.task("t1").unwrap().due_at.as_deref(), Some("2026-11-14T00:00:00Z"));
+    // The same day in the server's spelling is no change.
+    assert!(step(&mut t, due(Some("2026-11-14T00:00:00.000Z"))).is_empty());
+    let fx = step(&mut t, due(None));
+    assert_eq!(fx, vec![run(Op::UpdateTask { id: "t1".into(), patch: TaskPatch { due_at: Some(None), ..Default::default() } })]);
+    assert_eq!(t.task("t1").unwrap().due_at, None);
+    assert!(step(&mut t, due(None)).is_empty());
+}
+
+#[test]
+fn a_cleared_due_date_is_sent_as_null() {
+    let clear = TaskPatch { due_at: Some(None), ..Default::default() };
+    assert_eq!(serde_json::to_string(&clear).unwrap(), r#"{"due_at":null}"#);
+    assert_eq!(serde_json::to_string(&TaskPatch { done: Some(true), ..Default::default() }).unwrap(), r#"{"done":true}"#);
+}
+
+#[test]
 fn editing_sends_only_what_changed() {
     let mut t = loaded();
     let fx = step(&mut t, Event::EditTask { id: "t1".into(), title: "Milk".into(), description: "2 litres".into() });
