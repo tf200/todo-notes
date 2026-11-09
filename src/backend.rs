@@ -4,13 +4,18 @@
 //! added and ticked before its create returns is created first, then updated. Items made on
 //! this side carry a temporary id (`tmp-…`) until the server answers; the worker swaps it for
 //! the server's id in every later request.
+//!
+//! Each request carries the [`Creds`] of the sign-in that made it, so a request queued before
+//! a sign-out still goes out as that user, refreshing the access token if it has to.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use rune::Waker;
 
 use crate::api::Api;
+use crate::session::Creds;
 use crate::todos::{Op, Reply, is_temp};
 
 pub struct Backend {
@@ -21,10 +26,10 @@ pub struct Backend {
     stopped: Receiver<()>,
 }
 
-struct Job {
-    epoch: u64,
-    token: String,
-    op: Op,
+enum Job {
+    Run { epoch: u64, creds: Arc<Creds>, op: Op },
+    /// End a sign-in on the server, after everything queued before it.
+    Logout(Arc<Creds>),
 }
 
 impl Backend {
@@ -39,9 +44,16 @@ impl Backend {
                 let mut ids = HashMap::new();
                 // Ends when the queue closes: `finish`, or the app dropping its `Backend`.
                 for job in jobs {
-                    if let Some(r) = run(&api, &job.token, job.op, &mut ids) {
+                    let (epoch, creds, op) = match job {
+                        Job::Run { epoch, creds, op } => (epoch, creds, op),
+                        Job::Logout(creds) => {
+                            creds.logout();
+                            continue;
+                        }
+                    };
+                    if let Some(r) = run(&api, &creds, op, &mut ids) {
                         // The app may be gone (closing); keep going so queued saves still land.
-                        if reply.send((job.epoch, r)).is_ok() {
+                        if reply.send((epoch, r)).is_ok() {
                             waker();
                         }
                     }
@@ -53,9 +65,19 @@ impl Backend {
     }
 
     /// Queues `op`, tagged with the sign-in it belongs to.
-    pub fn run(&self, epoch: u64, token: &str, op: Op) {
+    pub fn run(&self, epoch: u64, creds: &Arc<Creds>, op: Op) {
         if let Some(send) = &self.send {
-            let _ = send.send(Job { epoch, token: token.to_string(), op });
+            let _ = send.send(Job::Run { epoch, creds: creds.clone(), op });
+        }
+    }
+
+    /// Queues the end of a sign-in: requests already queued for it go out first.
+    pub fn logout(&self, creds: &Arc<Creds>) {
+        match &self.send {
+            Some(send) => {
+                let _ = send.send(Job::Logout(creds.clone()));
+            }
+            None => creds.logout(),
         }
     }
 
@@ -80,20 +102,35 @@ mod live {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::session::{NoStore, Tokens};
     use crate::todos::{Effect, Event, Load, Todos, step};
 
     struct Rig {
         api: Api,
-        token: String,
+        creds: Arc<Creds>,
         backend: Backend,
         todos: Todos,
+    }
+
+    /// Signs in with the dev account: the tokens, and the API to use them with.
+    fn sign_in() -> (Api, Tokens) {
+        let base = std::env::var("TODO_API_URL").unwrap_or_else(|_| crate::api::DEFAULT_BASE_URL.into());
+        let api = Api::new(base);
+        let tokens = api
+            .login(&std::env::var("TODO_DEV_EMAIL").unwrap(), &std::env::var("TODO_DEV_PASSWORD").unwrap())
+            .expect("dev login");
+        (api, tokens)
+    }
+
+    fn creds(api: &Api, tokens: Tokens) -> Arc<Creds> {
+        Creds::new(tokens, Arc::new(api.clone()), Arc::new(NoStore))
     }
 
     impl Rig {
         fn send(&mut self, e: Event) {
             for fx in step(&mut self.todos, e) {
                 match fx {
-                    Effect::Run(op) => self.backend.run(self.todos.epoch, &self.token, op),
+                    Effect::Run(op) => self.backend.run(self.todos.epoch, &self.creds, op),
                     Effect::Unauthorized => panic!("unauthorized"),
                 }
             }
@@ -114,13 +151,9 @@ mod live {
     #[test]
     #[ignore = "needs the backend running and the dev account"]
     fn optimistic_edits_reach_the_server_in_order() {
-        let base = std::env::var("TODO_API_URL").unwrap_or_else(|_| crate::api::DEFAULT_BASE_URL.into());
-        let api = Api::new(base);
-        let token = api
-            .login(&std::env::var("TODO_DEV_EMAIL").unwrap(), &std::env::var("TODO_DEV_PASSWORD").unwrap())
-            .expect("dev login");
+        let (api, tokens) = sign_in();
         let backend = Backend::start(api.clone(), Arc::new(|| {}));
-        let mut rig = Rig { api, token, backend, todos: Todos::default() };
+        let mut rig = Rig { creds: creds(&api, tokens), api, backend, todos: Todos::default() };
         rig.send(Event::Open);
         rig.until(|t| matches!(t.lists, Load::Ready(_)));
 
@@ -145,7 +178,7 @@ mod live {
         // The worker runs in order: once this load answers, the tick before it is saved.
         rig.send(Event::Reload);
         std::thread::sleep(Duration::from_millis(300));
-        let saved = rig.api.tasks(&rig.token, &list).unwrap();
+        let saved = rig.creds.call(|t| rig.api.tasks(t, &list)).unwrap();
         let summary: Vec<_> = saved.iter().map(|t| (t.title.as_str(), t.done)).collect();
         assert_eq!(summary, [("Ticked before it was saved", true), ("Left open", false)]);
 
@@ -153,25 +186,23 @@ mod live {
         rig.send(Event::DeleteList(list.clone()));
         rig.until(|t| t.lists().iter().all(|l| l.id != list));
         std::thread::sleep(Duration::from_millis(500));
-        assert!(rig.api.lists(&rig.token).unwrap().iter().all(|l| l.id != list));
-        assert_eq!(rig.api.tasks(&rig.token, &list), Err(crate::api::ApiError::NotFound));
+        assert!(rig.creds.call(|t| rig.api.lists(t)).unwrap().iter().all(|l| l.id != list));
+        assert_eq!(rig.creds.call(|t| rig.api.tasks(t, &list)), Err(crate::api::ApiError::NotFound));
     }
 
     #[test]
     #[ignore = "needs the backend running and the dev account"]
     fn a_note_typed_and_pinned_before_its_create_returns_is_saved() {
         use crate::notes::{self, Event as N, Notes};
-        let base = std::env::var("TODO_API_URL").unwrap_or_else(|_| crate::api::DEFAULT_BASE_URL.into());
-        let api = Api::new(base);
-        let token = api
-            .login(&std::env::var("TODO_DEV_EMAIL").unwrap(), &std::env::var("TODO_DEV_PASSWORD").unwrap())
-            .expect("dev login");
+        let (api, tokens) = sign_in();
+        let creds = creds(&api, tokens);
+        let token = &creds;
         let backend = Backend::start(api.clone(), Arc::new(|| {}));
         let mut n = Notes::default();
         let send = |n: &mut Notes, e: N| {
             for fx in notes::step(n, e) {
                 if let Effect::Run(op) = fx {
-                    backend.run(0, &token, op);
+                    backend.run(0, token, op);
                 }
             }
         };
@@ -183,7 +214,7 @@ mod live {
                     Some((_, r)) => {
                         for fx in notes::step(n, N::Reply(r)) {
                             if let Effect::Run(op) = fx {
-                                backend.run(0, &token, op);
+                                backend.run(0, token, op);
                             }
                         }
                     }
@@ -202,55 +233,94 @@ mod live {
         let id = n.open.clone().unwrap();
         std::thread::sleep(Duration::from_millis(500));
 
-        let saved = api.notes(&token).unwrap().into_iter().find(|x| x.id == id).expect("on the server");
+        let saved = creds.call(|t| api.notes(t)).unwrap().into_iter().find(|x| x.id == id).expect("on the server");
         assert_eq!((saved.title.as_str(), saved.body.as_str(), saved.pinned), ("E2E note", "- [ ] one", true));
         assert_eq!(n.notice, None);
 
         send(&mut n, N::Delete(id.clone()));
         std::thread::sleep(Duration::from_millis(500));
-        assert!(api.notes(&token).unwrap().iter().all(|x| x.id != id));
+        assert!(creds.call(|t| api.notes(t)).unwrap().iter().all(|x| x.id != id));
+    }
+
+    #[test]
+    #[ignore = "needs the backend running and the dev account"]
+    fn a_refused_access_token_is_refreshed_and_the_request_retried() {
+        let (api, tokens) = sign_in();
+        let Some(refresh) = tokens.refresh.clone() else { panic!("the server gave no refresh token") };
+        // An access token the server will refuse, with a good refresh token.
+        let forged = Tokens { access: format!("{}x", tokens.access), refresh: Some(refresh.clone()) };
+        let c = creds(&api, forged);
+        let me = c.call(|t| api.me(t)).expect("refreshed and retried");
+        assert_eq!(me.email, std::env::var("TODO_DEV_EMAIL").unwrap().to_lowercase());
+
+        // Signing out (queued behind any saves) ends the sign-in on the server, the refresh
+        // token spent above included.
+        let mut backend = Backend::start(api.clone(), Arc::new(|| {}));
+        backend.logout(&c);
+        backend.finish(Duration::from_secs(5));
+        assert_eq!(c.call(|t| api.me(t)), Err(crate::api::ApiError::Unauthorized), "signed out here");
+        assert_eq!(api.refresh(&refresh).err(), Some(crate::api::ApiError::Unauthorized), "revoked on the server");
     }
 }
 
 /// Carries out one request. `ids` maps temporary ids to the server's. Returns `None` for a
 /// request about an item whose create failed: the model already took it back.
-fn run(api: &Api, token: &str, op: Op, ids: &mut HashMap<String, String>) -> Option<Reply> {
+fn run(api: &Api, creds: &Creds, op: Op, ids: &mut HashMap<String, String>) -> Option<Reply> {
     let id = |ids: &HashMap<String, String>, id: &str| -> Option<String> {
         if is_temp(id) { ids.get(id).cloned() } else { Some(id.to_string()) }
     };
     Some(match op {
-        Op::LoadLists => Reply::Lists(api.lists(token)),
+        Op::LoadLists => Reply::Lists(creds.call(|t| api.lists(t))),
         Op::LoadTasks { list } => {
             let real = id(ids, &list)?;
-            Reply::Tasks { list, result: api.tasks(token, &real) }
+            Reply::Tasks { list, result: creds.call(|t| api.tasks(t, &real)) }
         }
         Op::CreateList { tmp, title } => {
-            let result = api.create_list(token, &title);
+            let result = creds.call(|t| api.create_list(t, &title));
             if let Ok(l) = &result {
                 ids.insert(tmp.clone(), l.id.clone());
             }
             Reply::ListCreated { tmp, result }
         }
-        Op::RenameList { id: list, title } => Reply::Saved(api.rename_list(token, &id(ids, &list)?, &title)),
-        Op::DeleteList { id: list } => Reply::Saved(api.delete_list(token, &id(ids, &list)?)),
+        Op::RenameList { id: list, title } => {
+            let list = id(ids, &list)?;
+            Reply::Saved(creds.call(|t| api.rename_list(t, &list, &title)))
+        }
+        Op::DeleteList { id: list } => {
+            let list = id(ids, &list)?;
+            Reply::Saved(creds.call(|t| api.delete_list(t, &list)))
+        }
         Op::CreateTask { tmp, list, title } => {
-            let result = api.create_task(token, &id(ids, &list)?, &title);
+            let real = id(ids, &list)?;
+            let result = creds.call(|t| api.create_task(t, &real, &title));
             if let Ok(t) = &result {
                 ids.insert(tmp.clone(), t.id.clone());
             }
             Reply::TaskCreated { tmp, list, result }
         }
-        Op::UpdateTask { id: task, patch } => Reply::Saved(api.update_task(token, &id(ids, &task)?, &patch)),
-        Op::DeleteTask { id: task } => Reply::Saved(api.delete_task(token, &id(ids, &task)?)),
-        Op::LoadNotes => Reply::Notes(api.notes(token)),
+        Op::UpdateTask { id: task, patch } => {
+            let task = id(ids, &task)?;
+            Reply::Saved(creds.call(|t| api.update_task(t, &task, &patch)))
+        }
+        Op::DeleteTask { id: task } => {
+            let task = id(ids, &task)?;
+            Reply::Saved(creds.call(|t| api.delete_task(t, &task)))
+        }
+        Op::LoadNotes => Reply::Notes(creds.call(|t| api.notes(t))),
         Op::CreateNote { tmp, title, body } => {
-            let result = api.create_note(token, &title, &body);
+            let result = creds.call(|t| api.create_note(t, &title, &body));
             if let Ok(n) = &result {
                 ids.insert(tmp.clone(), n.id.clone());
             }
             Reply::NoteCreated { tmp, result }
         }
-        Op::UpdateNote { id: note, patch } => Reply::NoteSaved(api.update_note(token, &id(ids, &note)?, &patch)),
-        Op::DeleteNote { id: note } => Reply::NoteDeleted(api.delete_note(token, &id(ids, &note)?)),
+        Op::UpdateNote { id: note, patch } => {
+            let note = id(ids, &note)?;
+            Reply::NoteSaved(creds.call(|t| api.update_note(t, &note, &patch)))
+        }
+        Op::DeleteNote { id: note } => {
+            let note = id(ids, &note)?;
+            Reply::NoteDeleted(creds.call(|t| api.delete_note(t, &note)))
+        }
     })
 }

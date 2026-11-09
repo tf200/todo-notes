@@ -17,6 +17,7 @@ mod todos_ui;
 mod ui;
 
 use std::cell::Cell;
+use std::sync::Arc;
 
 use rune::machine::{Attempt, Seq};
 use rune::{AppSpec, KeyEvent, Latest, PointerPress, TextEdit, Tx, Waker};
@@ -25,7 +26,7 @@ use rune_kit::PaneState;
 use api::{Api, ApiError, Me};
 use auth::{Auth, Effect, Event, Mode};
 use backend::Backend;
-use session::{Keyring, NoStore, TokenStore};
+use session::{Creds, Keyring, NoStore, TokenStore, Tokens};
 use notes::Notes;
 use todos::Todos;
 
@@ -57,9 +58,11 @@ pub struct App {
     /// `poll` stops asking for frames. (Only the view can read the preference.)
     pub still: Cell<bool>,
     api: Api,
-    store: Box<dyn TokenStore>,
+    store: Arc<dyn TokenStore>,
+    /// The current sign-in's credentials, shared with the threads that make requests.
+    creds: Option<Arc<Creds>>,
     /// `/login` and `/register` answers, tagged with the attempt that asked.
-    sent: Latest<(Attempt, Result<String, ApiError>)>,
+    sent: Latest<(Attempt, Result<Tokens, ApiError>)>,
     /// `/api/me` answers for the saved token.
     checked: Latest<(Attempt, Result<Me, ApiError>)>,
 
@@ -111,9 +114,11 @@ impl App {
         let was_in = self.signed_in();
         for effect in auth::step(&mut self.seq, &mut self.auth, event) {
             match effect {
-                Effect::CheckToken { attempt, token } => {
+                Effect::CheckToken { attempt, tokens } => {
+                    let creds = self.begin(tokens);
                     let api = self.api.clone();
-                    self.checked.request(token, move |t| (attempt, api.me(&t)));
+                    // Refreshes on the way when the saved access token has run out.
+                    self.checked.request(creds, move |c| (attempt, c.call(|t| api.me(t))));
                 }
                 Effect::Send { attempt, mode, email, password } => {
                     let api = self.api.clone();
@@ -125,8 +130,21 @@ impl App {
                         (attempt, result)
                     });
                 }
-                Effect::SaveToken(token) => self.store.save(&token),
-                Effect::ClearToken => self.store.clear(),
+                Effect::Begin(tokens) => {
+                    self.store.save(&tokens.encode());
+                    self.begin(tokens);
+                }
+                Effect::Revoke => {
+                    if let (Some(b), Some(c)) = (&self.backend, &self.creds) {
+                        b.logout(c);
+                    }
+                }
+                Effect::ClearToken => {
+                    self.store.clear();
+                    if let Some(c) = self.creds.take() {
+                        c.detach();
+                    }
+                }
                 Effect::ForgetPassword => {
                     self.password.replace_text("");
                     self.reveal = false;
@@ -142,11 +160,19 @@ impl App {
         matches!(self.auth, Auth::SignedIn { .. })
     }
 
-    fn token(&self) -> Option<&str> {
-        match &self.auth {
-            Auth::SignedIn { session } => Some(&session.token),
-            _ => None,
+    /// Makes `tokens` the credentials requests go out with from now on.
+    fn begin(&mut self, tokens: Tokens) -> Arc<Creds> {
+        if let Some(old) = self.creds.take() {
+            old.detach();
         }
+        let creds = Creds::new(tokens, Arc::new(self.api.clone()), self.store.clone());
+        self.creds = Some(creds.clone());
+        creds
+    }
+
+    /// The credentials to send requests with, while signed in.
+    fn creds(&self) -> Option<&Arc<Creds>> {
+        self.creds.as_ref().filter(|_| self.signed_in())
     }
 
     fn open_todos(&mut self) {
@@ -180,8 +206,8 @@ impl App {
         for effect in notes::step(&mut self.notes, event) {
             match effect {
                 todos::Effect::Run(op) => {
-                    if let (Some(b), Some(token)) = (&self.backend, self.token()) {
-                        b.run(self.todos.epoch, token, op);
+                    if let (Some(b), Some(creds)) = (&self.backend, self.creds()) {
+                        b.run(self.todos.epoch, creds, op);
                     }
                 }
                 todos::Effect::Unauthorized => self.dispatch(Event::Unauthorized),
@@ -222,8 +248,8 @@ impl App {
             let event =
                 notes::Event::Edit { id, title: self.note_title.text.clone(), body: self.note_body.text.clone() };
             for effect in notes::step(&mut self.notes, event) {
-                if let (todos::Effect::Run(op), Some(b), Some(token)) = (effect, &self.backend, self.token()) {
-                    b.run(self.todos.epoch, token, op);
+                if let (todos::Effect::Run(op), Some(b), Some(creds)) = (effect, &self.backend, self.creds()) {
+                    b.run(self.todos.epoch, creds, op);
                 }
             }
         }
@@ -272,8 +298,8 @@ impl App {
         for effect in todos::step(&mut self.todos, event) {
             match effect {
                 todos::Effect::Run(op) => {
-                    if let (Some(b), Some(token)) = (&self.backend, self.token()) {
-                        b.run(self.todos.epoch, token, op);
+                    if let (Some(b), Some(creds)) = (&self.backend, self.creds()) {
+                        b.run(self.todos.epoch, creds, op);
                     }
                 }
                 todos::Effect::Unauthorized => self.dispatch(Event::Unauthorized),
@@ -415,7 +441,7 @@ fn headless() -> bool {
 
 fn init() -> App {
     // Headless runs (screenshots, scripted checks) never read or write the real credential store.
-    let store: Box<dyn TokenStore> = if headless() { Box::new(NoStore) } else { Box::new(Keyring) };
+    let store: Arc<dyn TokenStore> = if headless() { Arc::new(NoStore) } else { Arc::new(Keyring) };
     let base = std::env::var("TODO_API_URL").unwrap_or_else(|_| api::DEFAULT_BASE_URL.to_string());
     let mut email = TextEdit::new("");
     email.focused = true;
@@ -430,6 +456,7 @@ fn init() -> App {
         still: Cell::new(false),
         api: Api::new(base),
         store,
+        creds: None,
         sent: Latest::default(),
         checked: Latest::default(),
         todos: Todos::default(),

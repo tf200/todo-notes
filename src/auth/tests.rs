@@ -10,6 +10,11 @@ fn token(exp: u64) -> String {
     format!("h.{}.s", URL_SAFE_NO_PAD.encode(claims))
 }
 
+/// What `/login` returns: an access token and a refresh token.
+fn tokens(exp: u64) -> Tokens {
+    Tokens { access: token(exp), refresh: Some("rt_1".into()) }
+}
+
 fn me() -> Me {
     Me { id: "u1".into(), email: "a@b.co".into() }
 }
@@ -110,11 +115,11 @@ fn validation_errors_never_send() {
 fn successful_sign_in_saves_token_and_forgets_password() {
     let (mut seq, mut auth) = (Seq::default(), Auth::default());
     let attempt = submitted(&mut seq, &mut auth);
-    let t = token(NOW + 3600);
+    let t = tokens(NOW + 900);
     let fx: Vec<_> =
         step(&mut seq, &mut auth, Event::Answered { attempt, result: Ok(t.clone()) }).into_iter().collect();
-    assert!(matches!(auth, Auth::SignedIn { .. }));
-    assert_eq!(fx, vec![Effect::SaveToken(t), Effect::ForgetPassword]);
+    assert_eq!(auth, Auth::SignedIn { session: Session { email: "a@b.co".into() } });
+    assert_eq!(fx, vec![Effect::Begin(t), Effect::ForgetPassword]);
 }
 
 #[test]
@@ -142,7 +147,7 @@ fn stale_answer_is_ignored() {
     step(&mut seq, &mut auth, Event::Answered { attempt: first, result: Err(ApiError::Unreachable) });
     let second = submitted(&mut seq, &mut auth);
     // The first request's (late, duplicate) answer arrives while the second is in flight.
-    let fx = step(&mut seq, &mut auth, Event::Answered { attempt: first, result: Ok(token(NOW + 3600)) });
+    let fx = step(&mut seq, &mut auth, Event::Answered { attempt: first, result: Ok(tokens(NOW + 3600)) });
     assert!(fx.is_empty());
     assert!(matches!(auth, Auth::Submitting { attempt, .. } if attempt == second));
 }
@@ -157,15 +162,26 @@ fn editing_clears_error() {
 
 #[test]
 fn sign_out_and_401_return_to_form_and_clear_token() {
-    for (event, error) in [
-        (Event::SignOut, None),
-        (Event::Unauthorized, Some(FormError::Api(ApiError::Unauthorized))),
+    for (event, error, effects) in [
+        // Signing out also ends the sign-in on the server.
+        (Event::SignOut, None, vec![Effect::Revoke, Effect::ClearToken]),
+        (Event::Unauthorized, Some(FormError::Api(ApiError::Unauthorized)), vec![Effect::ClearToken]),
     ] {
         let (mut seq, mut auth) = (Seq::default(), Auth::default());
         let attempt = submitted(&mut seq, &mut auth);
-        step(&mut seq, &mut auth, Event::Answered { attempt, result: Ok(token(NOW + 3600)) });
+        step(&mut seq, &mut auth, Event::Answered { attempt, result: Ok(tokens(NOW + 3600)) });
         let fx: Vec<_> = step(&mut seq, &mut auth, event).into_iter().collect();
         assert_eq!(auth, Auth::SignedOut { error });
-        assert_eq!(fx, vec![Effect::ClearToken]);
+        assert_eq!(fx, effects);
     }
+}
+
+#[test]
+fn launch_with_an_expired_access_token_but_a_refresh_token_checks_it() {
+    // The check refreshes on the way; only a refused refresh signs the user out.
+    let saved = tokens(NOW - 3600).encode();
+    let (mut seq, mut auth) = (Seq::default(), Auth::default());
+    let fx: Vec<_> = step(&mut seq, &mut auth, Event::Launch { saved: Some(saved), now: NOW }).into_iter().collect();
+    assert!(matches!(auth, Auth::Checking { ref session, .. } if session.email == "a@b.co"));
+    assert!(matches!(fx.as_slice(), [Effect::CheckToken { tokens: t, .. }] if *t == tokens(NOW - 3600)));
 }

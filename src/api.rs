@@ -5,6 +5,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::session::{Renew, Tokens};
+
 pub const DEFAULT_BASE_URL: &str = "http://localhost:8090";
 
 /// What went wrong, in terms the UI can show. Raw server text never reaches the screen.
@@ -118,6 +120,14 @@ pub struct NotePatch {
 #[derive(Deserialize)]
 struct TokenBody {
     token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+impl From<TokenBody> for Tokens {
+    fn from(b: TokenBody) -> Tokens {
+        Tokens { access: b.token, refresh: b.refresh_token }
+    }
 }
 
 #[derive(Clone)]
@@ -136,27 +146,48 @@ impl Api {
         Api { base: base.into().trim_end_matches('/').to_string(), agent }
     }
 
-    /// `POST /login`: a JWT for these credentials.
-    pub fn login(&self, email: &str, password: &str) -> Result<String, ApiError> {
+    /// `POST /login`: a session for these credentials.
+    pub fn login(&self, email: &str, password: &str) -> Result<Tokens, ApiError> {
         let body = json!({ "email": email, "password": password });
         let (status, mut resp) = self.send(self.agent.post(self.url("/login")).send_json(body))?;
         match status {
-            200 => read_json::<TokenBody>(&mut resp).map(|b| b.token),
+            200 => read_json::<TokenBody>(&mut resp).map(Tokens::from),
             401 => Err(ApiError::InvalidCredentials),
             400 => Err(ApiError::BadInput),
             s => Err(ApiError::Server(s)),
         }
     }
 
-    /// `POST /register`: creates the account and returns a JWT, so the user is signed in.
-    pub fn register(&self, email: &str, password: &str) -> Result<String, ApiError> {
+    /// `POST /register`: creates the account and returns a session, so the user is signed in.
+    pub fn register(&self, email: &str, password: &str) -> Result<Tokens, ApiError> {
         let body = json!({ "email": email, "password": password });
         let (status, mut resp) =
             self.send(self.agent.post(self.url("/register")).send_json(body))?;
         match status {
-            201 | 200 => read_json::<TokenBody>(&mut resp).map(|b| b.token),
+            201 | 200 => read_json::<TokenBody>(&mut resp).map(Tokens::from),
             409 => Err(ApiError::EmailTaken),
             400 => Err(ApiError::BadInput),
+            s => Err(ApiError::Server(s)),
+        }
+    }
+
+    /// `POST /refresh`: the next access and refresh token. `Unauthorized` when the sign-in has
+    /// ended (revoked, expired, or the refresh token was already used).
+    pub fn refresh(&self, refresh: &str) -> Result<Tokens, ApiError> {
+        let body = json!({ "refresh_token": refresh });
+        let (status, mut resp) = self.send(self.agent.post(self.url("/refresh")).send_json(body))?;
+        match status {
+            200 => read_json::<TokenBody>(&mut resp).map(Tokens::from),
+            401 | 400 => Err(ApiError::Unauthorized),
+            s => Err(ApiError::Server(s)),
+        }
+    }
+
+    /// `POST /logout`: revokes the sign-in this refresh token belongs to.
+    pub fn logout(&self, refresh: &str) -> Result<(), ApiError> {
+        let body = json!({ "refresh_token": refresh });
+        match self.send(self.agent.post(self.url("/logout")).send_json(body))?.0 {
+            200 | 204 => Ok(()),
             s => Err(ApiError::Server(s)),
         }
     }
@@ -294,6 +325,15 @@ impl Api {
         // With `http_status_as_error(false)` every error here is transport: refused, DNS, timeout.
         let resp = result.map_err(|_| ApiError::Unreachable)?;
         Ok((resp.status().as_u16(), resp))
+    }
+}
+
+impl Renew for Api {
+    fn refresh(&self, refresh: &str) -> Result<Tokens, ApiError> {
+        Api::refresh(self, refresh)
+    }
+    fn logout(&self, refresh: &str) {
+        let _ = Api::logout(self, refresh);
     }
 }
 

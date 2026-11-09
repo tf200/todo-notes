@@ -215,7 +215,7 @@ fn sample_todos(s: &mut App, list: usize) {
     use crate::api::{Task, TaskList};
     use crate::todos::{Event as T, Reply, step};
     s.auth = Auth::SignedIn {
-        session: Session { token: String::new(), email: "taha@example.com".into(), expires_at: 0 },
+        session: Session { email: "taha@example.com".into() },
     };
     let lists = [("l1", "Groceries"), ("l2", "Work"), ("l3", "Weekend trip"), ("l4", "Empty list")];
     let tasks: &[(&str, &str, &str, bool, &str)] = &[
@@ -290,7 +290,7 @@ pub const SCENES: &[(&str, fn(&mut App))] = &[
     ("checking", |s| {
         s.auth = Auth::Checking {
             attempt: Default::default(),
-            session: Session { token: String::new(), email: "taha@example.com".into(), expires_at: 0 },
+            session: Session { email: "taha@example.com".into() },
         };
     }),
     ("todos", |s| sample_todos(s, 0)),
