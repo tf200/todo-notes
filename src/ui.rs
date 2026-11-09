@@ -15,7 +15,7 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     let k = rune_theme_opencode::kit(cx.system_dark());
     let content = match &s.auth {
         Auth::Checking { .. } => checking(k),
-        Auth::SignedIn { session } => signed_in(session, k),
+        Auth::SignedIn { session } => return crate::todos_ui::view(s, session, k, cx),
         Auth::SignedOut { error } => form(s, error.as_ref(), false, k),
         Auth::Submitting { .. } => form(s, None, true, k),
     };
@@ -180,18 +180,49 @@ fn checking(k: &Kit) -> El {
         .child(text("Signing you in…").font(k.ty.ui).color(k.c.text_muted))
 }
 
-fn signed_in(session: &Session, k: &Kit) -> El {
-    card(k)
-        .child(heading("You're signed in", &format!("Signed in as {}.", session.email), k))
-        .child(text("Your todos and notes come next.").font(k.ty.ui).color(k.c.text_muted))
-        .child(
-            Button::new("Sign out")
-                .control_size(ControlSize::Large)
-                .on_press_tx(|s: &mut App, tx: &mut Tx| s.sign_out(tx))
-                .build(k)
-                .key("sign-out")
-                .w_full(),
-        )
+/// Signs a scene in with sample lists, without a server.
+fn sample_todos(s: &mut App, list: usize) {
+    use crate::api::{Task, TaskList};
+    use crate::todos::{Event as T, Reply, step};
+    s.auth = Auth::SignedIn {
+        session: Session { token: String::new(), email: "taha@example.com".into(), expires_at: 0 },
+    };
+    let lists = [("l1", "Groceries"), ("l2", "Work"), ("l3", "Weekend trip"), ("l4", "Empty list")];
+    let tasks: &[(&str, &str, &str, bool, &str)] = &[
+        ("t1", "l1", "Oat milk", false, ""),
+        ("t2", "l1", "Sourdough bread", false, "From the bakery on 5th, not the supermarket."),
+        ("t3", "l1", "Eggs (a dozen)", false, ""),
+        ("t4", "l1", "Coffee beans", true, ""),
+        ("t5", "l1", "Spinach", true, ""),
+        ("t6", "l2", "Review the auth PR", false, ""),
+        ("t7", "l2", "Write the release notes", false, ""),
+        ("t8", "l3", "Book the cabin", true, ""),
+    ];
+    step(&mut s.todos, T::Open);
+    let to_list = |(id, title): &(&str, &str)| TaskList {
+        id: id.to_string(),
+        title: title.to_string(),
+        created_at: "2026-11-01T09:00:00Z".into(),
+    };
+    step(&mut s.todos, T::Reply(Reply::Lists(Ok(lists.iter().map(to_list).collect()))));
+    for (lid, _) in &lists {
+        let mine = tasks
+            .iter()
+            .filter(|t| t.1 == *lid)
+            .map(|&(id, l, title, done, notes)| Task {
+                id: id.into(),
+                list_id: l.into(),
+                title: title.into(),
+                description: notes.into(),
+                due_at: (id == "t7").then(|| "2026-11-14T00:00:00Z".to_string()),
+                done,
+                created_at: "2026-11-02T10:00:00Z".into(),
+            })
+            .collect();
+        step(&mut s.todos, T::Select(lid.to_string()));
+        step(&mut s.todos, T::Reply(Reply::Tasks { list: lid.to_string(), result: Ok(mine) }));
+    }
+    step(&mut s.todos, T::Select(lists[list].0.to_string()));
 }
 
 /// Fixed states for headless screenshots: `--scene <name>`.
@@ -219,9 +250,25 @@ pub const SCENES: &[(&str, fn(&mut App))] = &[
             session: Session { token: String::new(), email: "taha@example.com".into(), expires_at: 0 },
         };
     }),
-    ("signed-in", |s| {
-        s.auth = Auth::SignedIn {
-            session: Session { token: String::new(), email: "taha@example.com".into(), expires_at: 0 },
-        };
+    ("todos", |s| sample_todos(s, 0)),
+    ("todos-details", |s| {
+        sample_todos(s, 0);
+        s.open_task("t2".into());
+    }),
+    ("todos-empty-list", |s| sample_todos(s, 3)),
+    ("todos-delete", |s| {
+        sample_todos(s, 0);
+        s.confirm_delete = Some("l1".into());
+    }),
+    ("todos-notice", |s| {
+        sample_todos(s, 1);
+        s.todos.notice = Some("Couldn't save your change. Can't reach the server.".into());
+    }),
+    ("todos-none", |s| {
+        sample_todos(s, 0);
+        let lists = s.todos.lists().iter().map(|l| l.id.clone()).collect::<Vec<_>>();
+        for id in lists {
+            s.todo(crate::todos::Event::DeleteList(id));
+        }
     }),
 ];

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub const DEFAULT_BASE_URL: &str = "http://localhost:8090";
@@ -20,6 +20,8 @@ pub enum ApiError {
     Unauthorized,
     /// No answer: the server is down, the port is wrong, or the request timed out.
     Unreachable,
+    /// The list or task is gone (404 on `/api/*`): deleted elsewhere, or never saved.
+    NotFound,
     /// Anything else (5xx, an unexpected body).
     Server(u16),
 }
@@ -32,6 +34,7 @@ impl ApiError {
             ApiError::BadInput => "Check the email and password and try again.",
             ApiError::Unauthorized => "Your session has expired. Sign in again.",
             ApiError::Unreachable => "Can't reach the server. Check that it's running.",
+            ApiError::NotFound => "That item no longer exists.",
             ApiError::Server(_) => "Something went wrong on the server. Try again.",
         }
     }
@@ -41,6 +44,44 @@ impl ApiError {
 pub struct Me {
     pub id: String,
     pub email: String,
+}
+
+/// A todo list (`/api/lists`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TaskList {
+    pub id: String,
+    pub title: String,
+    /// RFC 3339; sorts in creation order as text.
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// A task in a list (`/api/lists/:id/tasks`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Task {
+    pub id: String,
+    pub list_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    /// RFC 3339, when set.
+    #[serde(default)]
+    pub due_at: Option<String>,
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// The fields of a task to change (`PUT /api/tasks/:id`); `None` leaves a field as it is.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TaskPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +141,85 @@ impl Api {
         }
     }
 
+    /// `GET /api/lists`: the user's lists, oldest first.
+    pub fn lists(&self, token: &str) -> Result<Vec<TaskList>, ApiError> {
+        let req = self.agent.get(self.url("/api/lists")).header("Authorization", bearer(token));
+        let mut lists = self.read_vec::<TaskList>(req.call())?;
+        lists.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(lists)
+    }
+
+    /// `POST /api/lists`.
+    pub fn create_list(&self, token: &str, title: &str) -> Result<TaskList, ApiError> {
+        let req = self.agent.post(self.url("/api/lists")).header("Authorization", bearer(token));
+        let (status, mut resp) = self.send(req.send_json(json!({ "title": title })))?;
+        match status {
+            200 | 201 => read_json(&mut resp),
+            s => Err(api_status(s)),
+        }
+    }
+
+    /// `PUT /api/lists/:id`.
+    pub fn rename_list(&self, token: &str, id: &str, title: &str) -> Result<(), ApiError> {
+        let req = self.agent.put(self.url(&format!("/api/lists/{id}"))).header("Authorization", bearer(token));
+        self.expect_ok(req.send_json(json!({ "title": title })))
+    }
+
+    /// `DELETE /api/lists/:id` (the server deletes its tasks too).
+    pub fn delete_list(&self, token: &str, id: &str) -> Result<(), ApiError> {
+        let req = self.agent.delete(self.url(&format!("/api/lists/{id}"))).header("Authorization", bearer(token));
+        self.expect_ok(req.call())
+    }
+
+    /// `GET /api/lists/:id/tasks`: the list's tasks, oldest first.
+    pub fn tasks(&self, token: &str, list: &str) -> Result<Vec<Task>, ApiError> {
+        let req = self.agent.get(self.url(&format!("/api/lists/{list}/tasks"))).header("Authorization", bearer(token));
+        let mut tasks = self.read_vec::<Task>(req.call())?;
+        tasks.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(tasks)
+    }
+
+    /// `POST /api/lists/:id/tasks`.
+    pub fn create_task(&self, token: &str, list: &str, title: &str) -> Result<Task, ApiError> {
+        let req = self.agent.post(self.url(&format!("/api/lists/{list}/tasks"))).header("Authorization", bearer(token));
+        let (status, mut resp) = self.send(req.send_json(json!({ "title": title })))?;
+        match status {
+            200 | 201 => read_json(&mut resp),
+            s => Err(api_status(s)),
+        }
+    }
+
+    /// `PUT /api/tasks/:id` with only the fields that changed.
+    pub fn update_task(&self, token: &str, id: &str, patch: &TaskPatch) -> Result<(), ApiError> {
+        let req = self.agent.put(self.url(&format!("/api/tasks/{id}"))).header("Authorization", bearer(token));
+        self.expect_ok(req.send_json(patch))
+    }
+
+    /// `DELETE /api/tasks/:id`.
+    pub fn delete_task(&self, token: &str, id: &str) -> Result<(), ApiError> {
+        let req = self.agent.delete(self.url(&format!("/api/tasks/{id}"))).header("Authorization", bearer(token));
+        self.expect_ok(req.call())
+    }
+
+    /// A JSON array body; the server sends `null` for none.
+    fn read_vec<T: for<'de> Deserialize<'de>>(
+        &self,
+        result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<Vec<T>, ApiError> {
+        let (status, mut resp) = self.send(result)?;
+        match status {
+            200 => read_json::<Option<Vec<T>>>(&mut resp).map(Option::unwrap_or_default),
+            s => Err(api_status(s)),
+        }
+    }
+
+    fn expect_ok(&self, result: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<(), ApiError> {
+        match self.send(result)?.0 {
+            200 | 201 | 204 => Ok(()),
+            s => Err(api_status(s)),
+        }
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
     }
@@ -116,6 +236,16 @@ impl Api {
 
 fn bearer(token: &str) -> String {
     format!("Bearer {token}")
+}
+
+/// An unexpected status from an `/api/*` route.
+fn api_status(status: u16) -> ApiError {
+    match status {
+        401 => ApiError::Unauthorized,
+        404 => ApiError::NotFound,
+        400 => ApiError::BadInput,
+        s => ApiError::Server(s),
+    }
 }
 
 #[cfg(test)]
