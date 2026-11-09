@@ -1,0 +1,21 @@
+[package]
+name = "todo-notes"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Rune pins a `dev` rev; `dev` is never rewritten. Bump all three together.
+rune = { git = "https://github.com/anomalyco/rune", rev = "a6a59e697df7e7a7c95b91c915d1a24e00681760" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "a6a59e697df7e7a7c95b91c915d1a24e00681760" }
+rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "a6a59e697df7e7a7c95b91c915d1a24e00681760" }
+
+ureq = { version = "3", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+keyring = { version = "3", features = ["windows-native"] }
+
+[profile.dev.package."*"]
+# Dependencies (the renderer, text shaping) build optimised, so debug runs stay smooth.
+opt-level = 2
