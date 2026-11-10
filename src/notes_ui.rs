@@ -1,7 +1,7 @@
 //! The notes screen: notes in the sidebar (pinned first), the open note's editor in the main
 //! pane, with a Markdown preview whose task boxes tick in the note.
 
-use rune::{Cx, El, ScrollSpec, TextStyle, Tx, col, row, text};
+use rune::{Cx, El, ScrollSpec, TextStyle, Tx, col, el, row, text};
 use rune_kit::shell::SidebarToggle;
 use rune_kit::{
     Button, ButtonVariant, ControlSize, Kit, Markdown, MenuItem, SegmentedControl, SidebarRow, SidebarSection, Spinner,
@@ -24,7 +24,8 @@ pub fn split(s: &App, session: &Session, k: &Kit, cx: &mut Cx<App>, layer: &mut 
     if let Some(note) = open {
         toolbar = toolbar.trailing(toolbar_actions(s, note, k));
     }
-    SplitView::new(main_pane(s, k))
+    let main = main_pane(s, k, layer);
+    SplitView::new(main)
         .sidebar(&s.sidebar, |s: &mut App| &mut s.sidebar, sidebar(s, session, k, layer))
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
@@ -146,11 +147,11 @@ fn retry(k: &Kit) -> El {
 
 // The editor.
 
-fn main_pane(s: &App, k: &Kit) -> El {
+fn main_pane(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let body = match (&s.notes.notes, s.notes.open_note()) {
         (Load::Loading, _) => centered(Spinner::new().build(k)),
         (Load::Failed(e), _) => empty_state("Couldn't load your notes", e.message(), Some(retry(k)), k),
-        (Load::Ready(_), Some(note)) => editor(s, note, k),
+        (Load::Ready(_), Some(note)) => editor(s, note, k, layer),
         (Load::Ready(_), None) => empty_state(
             "No notes yet",
             "Write down ideas, plans and checklists. Markdown works.",
@@ -171,7 +172,8 @@ fn main_pane(s: &App, k: &Kit) -> El {
     pane.child(body)
 }
 
-fn editor(s: &App, note: &Note, k: &Kit) -> El {
+fn editor(s: &App, note: &Note, k: &Kit, layer: &mut Vec<El>) -> El {
+    let owner = (crate::api::Parent::Note, note.id.clone());
     let title = TextInput::new(&s.note_title)
         .plain()
         .text_style(TextStyle::new(26.0, 700.0).lh(34.0))
@@ -219,12 +221,15 @@ fn editor(s: &App, note: &Note, k: &Kit) -> El {
         .gap(8.0)
         .child(title)
         .child(text(meta).key("note-meta").font(k.ty.small).color(k.c.text_faint).mb(12.0))
-        .child(content);
-    col()
+        .child(content)
+        .child(el().key("files-rule").w_full().h(1.0).fill(k.c.border_weak).mt(24.0).mb(8.0))
+        .child(crate::attachments_ui::section(s, &owner, k, layer));
+    let scroll = col()
         .key("note-scroll")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom: false })
-        .child(col().key("note-pad").w_full().px(40.0).pt(24.0).pb(64.0).items_center().child(page))
+        .child(col().key("note-pad").w_full().px(40.0).pt(24.0).pb(64.0).items_center().child(page));
+    crate::attachments_ui::drop_target(scroll, &owner)
 }

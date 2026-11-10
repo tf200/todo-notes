@@ -8,6 +8,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
+mod attachments;
+mod attachments_ui;
 mod auth;
 mod backdrop;
 mod backend;
@@ -40,6 +42,7 @@ pub enum MenuTarget {
     List(String),
     Task(String),
     Note(String),
+    Attachment(String),
 }
 
 /// Which half of the app the window shows.
@@ -104,6 +107,12 @@ pub struct App {
     note_loaded: Option<String>,
     /// The editor shows the rendered Markdown instead of the source.
     pub note_preview: bool,
+
+    /// Files on tasks and notes, and the threads that move them.
+    pub files: attachments::Files,
+    transfers: Option<attachments::Transfers>,
+    /// A file is being dragged over the open task or note.
+    pub drop_over: bool,
 
     /// New versions, found and downloaded in the background.
     pub updates: updates::Updates,
@@ -191,6 +200,8 @@ impl App {
         self.section = Section::Tasks;
         self.note_loaded = None;
         self.note_preview = false;
+        self.files = attachments::Files::default();
+        self.drop_over = false;
         self.todo(todos::Event::Open);
         self.note(notes::Event::Open);
     }
@@ -360,8 +371,13 @@ impl App {
         self.task_title = TextEdit::new(task.title.clone());
         self.task_notes = TextEdit::new(task.description.clone());
         self.due_picker = None;
-        self.todo(todos::Event::OpenTask(Some(id)));
+        self.todo(todos::Event::OpenTask(Some(id.clone())));
         self.details.set_open(true);
+        // Opening a task again refreshes its files (another device may have added some).
+        let owner = (api::Parent::Task, id);
+        if attachments::attachable(&owner) {
+            self.load_files(owner);
+        }
     }
 
     /// Sets or removes a task's due day, closing the picker.
@@ -432,6 +448,105 @@ impl App {
         self.renaming = Some(id);
     }
 
+    // Attachments.
+
+    /// The open task and the open note, as attachment owners.
+    fn open_owners(&self) -> Vec<attachments::Owner> {
+        let mut owners = Vec::new();
+        if let Some(id) = &self.todos.open_task {
+            owners.push((api::Parent::Task, id.clone()));
+        }
+        if let Some(id) = &self.notes.open {
+            owners.push((api::Parent::Note, id.clone()));
+        }
+        owners
+    }
+
+    /// Loads the files of the open task and note when they aren't loaded yet.
+    fn sync_files(&mut self) {
+        for owner in self.open_owners() {
+            if attachments::attachable(&owner) && self.files.of(&owner).is_none() {
+                self.load_files(owner);
+            }
+        }
+    }
+
+    /// Asks for an item's files; what's shown stays until the answer.
+    fn load_files(&mut self, owner: attachments::Owner) {
+        let (Some(t), Some(creds)) = (&self.transfers, self.creds().cloned()) else { return };
+        t.list(self.todos.epoch, &creds, owner.clone());
+        self.files.lists.entry(owner).or_insert(todos::Load::Loading);
+    }
+
+    /// Uploads files (dropped or picked) to the task or note.
+    pub fn attach(&mut self, owner: attachments::Owner, paths: &[std::path::PathBuf]) {
+        if !attachments::attachable(&owner) {
+            return;
+        }
+        for path in paths {
+            match attachments::check_file(path) {
+                Err((name, why)) => self.files.refuse_upload(owner.clone(), name, 0, why),
+                Ok((name, size)) => {
+                    let (Some(t), Some(creds)) = (&self.transfers, self.creds().cloned()) else { return };
+                    let (key, sent) = self.files.begin_upload(owner.clone(), name, size);
+                    t.upload(self.todos.epoch, &creds, owner.clone(), key, path.clone(), sent);
+                }
+            }
+        }
+    }
+
+    /// The system's Open dialog, then uploads the picked file.
+    pub fn pick_attachment(&mut self, owner: attachments::Owner, tx: &mut Tx) {
+        let options = rune::FileDialogOptions { title: "Attach a file".into(), ..Default::default() };
+        tx.open_file(options, move |s: &mut App, result, _: &mut Tx| match result {
+            Ok(Some(path)) => s.attach(owner, &[path]),
+            Ok(None) => {}
+            Err(e) => s.files.notice = Some(format!("Couldn't open the file picker: {e}")),
+        });
+    }
+
+    fn attachment(&self, owner: &attachments::Owner, id: &str) -> Option<api::Attachment> {
+        match self.files.of(owner)? {
+            todos::Load::Ready(list) => list.iter().find(|a| a.id == id).cloned(),
+            _ => None,
+        }
+    }
+
+    pub fn open_attachment(&mut self, owner: &attachments::Owner, id: &str) {
+        let Some(a) = self.attachment(owner, id) else { return };
+        if self.files.busy.contains(id) {
+            return;
+        }
+        let (Some(t), Some(creds)) = (&self.transfers, self.creds().cloned()) else { return };
+        self.files.busy.insert(a.id.clone());
+        t.open(self.todos.epoch, &creds, a);
+    }
+
+    /// The system's Save dialog, then writes the file where the user chose.
+    pub fn save_attachment(&mut self, owner: &attachments::Owner, id: &str, tx: &mut Tx) {
+        let Some(a) = self.attachment(owner, id) else { return };
+        let options = rune::FileDialogOptions {
+            title: "Save attachment".into(),
+            file_name: Some(attachments::safe_name(&a.name)),
+            ..Default::default()
+        };
+        tx.save_file(options, move |s: &mut App, result, _: &mut Tx| match result {
+            Ok(Some(dest)) => {
+                let (Some(t), Some(creds)) = (&s.transfers, s.creds().cloned()) else { return };
+                s.files.busy.insert(a.id.clone());
+                t.save(s.todos.epoch, &creds, a, dest);
+            }
+            Ok(None) => {}
+            Err(e) => s.files.notice = Some(format!("Couldn't open the save dialog: {e}")),
+        });
+    }
+
+    pub fn remove_attachment(&mut self, owner: &attachments::Owner, id: &str) {
+        let (Some(t), Some(creds)) = (&self.transfers, self.creds().cloned()) else { return };
+        self.files.busy.insert(id.to_string());
+        t.remove(self.todos.epoch, &creds, owner.clone(), id.to_string());
+    }
+
     /// Saves what's open, then closes so Velopack can install the downloaded version and start
     /// it again (closing runs `on_close`, which lets queued saves reach the server first).
     pub fn restart_to_update(&mut self, tx: &mut Tx) {
@@ -497,6 +612,9 @@ fn init() -> App {
         note_body: TextEdit::new(""),
         note_loaded: None,
         note_preview: false,
+        files: attachments::Files::default(),
+        transfers: None,
+        drop_over: false,
         updates: updates::Updates::off(),
     }
 }
@@ -508,6 +626,7 @@ fn setup(s: &mut App, waker: Waker) {
     }
     s.sent.set_waker(waker.clone());
     s.checked.set_waker(waker.clone());
+    s.transfers = Some(attachments::Transfers::start(s.api.clone(), waker.clone()));
     s.backend = Some(Backend::start(s.api.clone(), waker));
     let saved = s.store.load();
     s.dispatch(Event::Launch { saved, now: session::now_unix() });
@@ -552,6 +671,19 @@ fn poll(s: &mut App, now: f64, _tx: &mut Tx) -> bool {
             }
         }
         changed = true;
+    }
+    while let Some((epoch, reply)) = s.transfers.as_ref().and_then(attachments::Transfers::take) {
+        if epoch == s.todos.epoch && s.signed_in() && s.files.apply(reply) {
+            s.dispatch(Event::Unauthorized);
+        }
+        changed = true;
+    }
+    // Uploads under way: redraw their progress (their threads wake the window as they go).
+    if s.files.uploads.iter().any(|u| u.failed.is_none()) {
+        changed = true;
+    }
+    if s.signed_in() {
+        s.sync_files();
     }
     changed
 }

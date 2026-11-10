@@ -29,6 +29,14 @@ pub enum ApiError {
     Unreachable,
     /// The list or task is gone (404 on `/api/*`): deleted elsewhere, or never saved.
     NotFound,
+    /// A file over the server's size limit (`ATTACHMENT_MAX` bytes).
+    TooLarge,
+    /// The account's attachment storage is full.
+    StorageFull,
+    /// The task or note has as many attachments as it may have.
+    TooManyFiles,
+    /// The server has no attachment store set up (503).
+    AttachmentsOff,
     /// Anything else (5xx, an unexpected body).
     Server(u16),
 }
@@ -42,6 +50,10 @@ impl ApiError {
             ApiError::Unauthorized => "Your session has expired. Sign in again.",
             ApiError::Unreachable => "Can't reach the server. Check that it's running.",
             ApiError::NotFound => "That item no longer exists.",
+            ApiError::TooLarge => "Files can be at most 25 MB.",
+            ApiError::StorageFull => "Your attachment storage is full. Remove some files to add more.",
+            ApiError::TooManyFiles => "This item has as many attachments as it can hold.",
+            ApiError::AttachmentsOff => "Attachments aren't available on this server yet.",
             ApiError::Server(_) => "Something went wrong on the server. Try again.",
         }
     }
@@ -120,6 +132,63 @@ pub struct NotePatch {
     pub body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned: Option<bool>,
+}
+
+/// The largest file the server takes, in bytes: checked here too, before uploading.
+pub const ATTACHMENT_MAX: u64 = 25 << 20;
+
+/// What an attachment hangs off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Parent {
+    Task,
+    Note,
+}
+
+impl Parent {
+    fn path(self) -> &'static str {
+        match self {
+            Parent::Task => "tasks",
+            Parent::Note => "notes",
+        }
+    }
+}
+
+/// A file on a task or note (`/api/tasks/:id/attachments`, `/api/notes/:id/attachments`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Attachment {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub mime: String,
+    pub size: u64,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// Where and how to send a new attachment's bytes: straight to the file store, with these
+/// headers exactly (they're part of the link's signature).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct UploadLink {
+    pub url: String,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct Started {
+    attachment: Attachment,
+    upload: UploadLink,
+}
+
+#[derive(Deserialize)]
+struct Link {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct ErrorBody {
+    #[serde(default)]
+    code: String,
 }
 
 #[derive(Deserialize)]
@@ -300,6 +369,65 @@ impl Api {
         self.expect_ok(req.call())
     }
 
+    /// `GET /api/{tasks|notes}/:id/attachments`: the item's files, oldest first.
+    pub fn attachments(&self, token: &str, parent: Parent, id: &str) -> Result<Vec<Attachment>, ApiError> {
+        let req = self.agent.get(self.url(&format!("/api/{}/{id}/attachments", parent.path()))).header("Authorization", bearer(token));
+        let (status, mut resp) = self.send(req.call())?;
+        match status {
+            200 => read_json::<Option<Vec<Attachment>>>(&mut resp).map(Option::unwrap_or_default),
+            s => Err(attachment_error(s, &mut resp)),
+        }
+    }
+
+    /// `POST /api/{tasks|notes}/:id/attachments`: a pending attachment, and the link to send
+    /// its bytes to. It shows up once [`Api::complete_attachment`] confirms the upload.
+    pub fn start_attachment(
+        &self,
+        token: &str,
+        parent: Parent,
+        id: &str,
+        name: &str,
+        size: u64,
+        mime: &str,
+    ) -> Result<(Attachment, UploadLink), ApiError> {
+        let req = self.agent.post(self.url(&format!("/api/{}/{id}/attachments", parent.path()))).header("Authorization", bearer(token));
+        let (status, mut resp) = self.send(req.send_json(json!({ "name": name, "size": size, "mime": mime })))?;
+        match status {
+            200 | 201 => read_json::<Started>(&mut resp).map(|s| (s.attachment, s.upload)),
+            s => Err(attachment_error(s, &mut resp)),
+        }
+    }
+
+    /// `POST /api/attachments/:id/complete`, once the bytes are uploaded.
+    pub fn complete_attachment(&self, token: &str, id: &str) -> Result<Attachment, ApiError> {
+        let req = self.agent.post(self.url(&format!("/api/attachments/{id}/complete"))).header("Authorization", bearer(token));
+        let (status, mut resp) = self.send(req.send_empty())?;
+        match status {
+            200 => read_json(&mut resp),
+            s => Err(attachment_error(s, &mut resp)),
+        }
+    }
+
+    /// `GET /api/attachments/:id/download`: a link to the file, good for a few minutes.
+    pub fn attachment_link(&self, token: &str, id: &str) -> Result<String, ApiError> {
+        let req = self.agent.get(self.url(&format!("/api/attachments/{id}/download"))).header("Authorization", bearer(token));
+        let (status, mut resp) = self.send(req.call())?;
+        match status {
+            200 => read_json::<Link>(&mut resp).map(|l| l.url),
+            s => Err(attachment_error(s, &mut resp)),
+        }
+    }
+
+    /// `DELETE /api/attachments/:id`.
+    pub fn delete_attachment(&self, token: &str, id: &str) -> Result<(), ApiError> {
+        let req = self.agent.delete(self.url(&format!("/api/attachments/{id}"))).header("Authorization", bearer(token));
+        let (status, mut resp) = self.send(req.call())?;
+        match status {
+            200 | 204 => Ok(()),
+            s => Err(attachment_error(s, &mut resp)),
+        }
+    }
+
     /// A JSON array body; the server sends `null` for none.
     fn read_vec<T: for<'de> Deserialize<'de>>(
         &self,
@@ -366,6 +494,18 @@ mod tests {
         let api = Api::new("http://127.0.0.1:9");
         assert_eq!(api.login("a@b.co", "pw"), Err(ApiError::Unreachable));
         assert_eq!(api.me("token"), Err(ApiError::Unreachable));
+    }
+}
+
+/// An attachment route's error: the body's `code` tells the limits apart.
+fn attachment_error(status: u16, resp: &mut ureq::http::Response<ureq::Body>) -> ApiError {
+    let code = resp.body_mut().read_json::<ErrorBody>().map(|b| b.code).unwrap_or_default();
+    match (status, code.as_str()) {
+        (_, "too_large") => ApiError::TooLarge,
+        (_, "quota") => ApiError::StorageFull,
+        (_, "too_many") => ApiError::TooManyFiles,
+        (503, _) | (_, "disabled") => ApiError::AttachmentsOff,
+        (s, _) => api_status(s),
     }
 }
 

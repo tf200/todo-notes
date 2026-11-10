@@ -198,6 +198,30 @@ fn checking(k: &Kit) -> El {
         .child(text("Signing you in…").font(k.ty.ui).color(k.c.text_muted))
 }
 
+/// Files on `owner`: two uploaded, one uploading, one refused, and one being opened.
+fn sample_files(s: &mut App, owner: crate::attachments::Owner) {
+    use crate::api::Attachment;
+    let file = |id: &str, name: &str, mime: &str, size: u64| Attachment {
+        id: id.into(),
+        name: name.into(),
+        mime: mime.into(),
+        size,
+        created_at: "2026-11-08T09:00:00Z".into(),
+    };
+    s.files.lists.insert(
+        owner.clone(),
+        crate::todos::Load::Ready(vec![
+            file("a1", "bakery-receipt.jpg", "image/jpeg", 1_258_291),
+            file("a2", "shopping list for the long weekend at the cabin.pdf", "application/pdf", 348_160),
+            file("a3", "prices.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 18_944),
+        ]),
+    );
+    s.files.busy.insert("a3".into());
+    let (_, sent) = s.files.begin_upload(owner.clone(), "photo of the shelf.heic".into(), 4_000_000);
+    sent.store(2_600_000, std::sync::atomic::Ordering::Relaxed);
+    s.files.refuse_upload(owner, "holiday video.mp4".into(), 0, crate::api::ApiError::TooLarge.message().into());
+}
+
 /// Signs a scene in with sample notes, the first open.
 fn sample_notes(s: &mut App, preview: bool) {
     use crate::api::Note;
@@ -338,6 +362,21 @@ pub const SCENES: &[(&str, fn(&mut App))] = &[
     ("todos-notice", |s| {
         sample_todos(s, 1);
         s.todos.notice = Some("Couldn't save your change. Can't reach the server.".into());
+    }),
+    ("todos-attachments", |s| {
+        sample_todos(s, 0);
+        s.open_task("t2".into());
+        sample_files(s, (crate::api::Parent::Task, "t2".into()));
+    }),
+    ("todos-attachments-drop", |s| {
+        sample_todos(s, 0);
+        s.open_task("t3".into());
+        s.files.lists.insert((crate::api::Parent::Task, "t3".into()), crate::todos::Load::Ready(vec![]));
+        s.drop_over = true;
+    }),
+    ("notes-attachments", |s| {
+        sample_notes(s, true);
+        sample_files(s, (crate::api::Parent::Note, "n1".into()));
     }),
     ("notes", |s| sample_notes(s, false)),
     ("notes-preview", |s| sample_notes(s, true)),

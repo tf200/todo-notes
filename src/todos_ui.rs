@@ -551,6 +551,7 @@ fn details(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         );
     };
     let id = task.id.clone();
+    let owner = (crate::api::Parent::Task, task.id.clone());
     let done = task.done;
     let label = |t: &str| text(t.to_string()).font(k.ty.small_medium).color(k.c.text_muted);
     let title = TextInput::new(&s.task_title)
@@ -603,12 +604,13 @@ fn details(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(col().gap(6.0).child(label("Title")).child(title))
         .child(col().gap(6.0).child(label("Due")).child(due_picker(s, task, k, layer)))
         .child(col().gap(6.0).child(label("Notes")).child(notes))
+        .child(crate::attachments_ui::section(s, &owner, k, layer))
         .child(done_box)
         .child(actions);
     if let Some(day) = task.created_at.get(..10) {
         pane = pane.child(text(format!("Created {day}")).font(k.ty.small).color(k.c.text_faint));
     }
-    pane
+    crate::attachments_ui::drop_target(pane, &owner)
 }
 
 /// The due-date button, and the picker it opens: quick days, a month, and "Remove".

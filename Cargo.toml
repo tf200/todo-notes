@@ -1,12 +1,13 @@
 [package]
 name = "todo-notes"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish = false
 
 [dependencies]
 # Rune pins a `dev` rev; `dev` is never rewritten. Bump all three together.
-rune = { git = "https://github.com/anomalyco/rune", rev = "a6a59e697df7e7a7c95b91c915d1a24e00681760" }
+# native-file-dialog: the Open and Save dialogs for attachments.
+rune = { git = "https://github.com/anomalyco/rune", rev = "a6a59e697df7e7a7c95b91c915d1a24e00681760", features = ["native-file-dialog"] }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "a6a59e697df7e7a7c95b91c915d1a24e00681760", features = ["markdown"] }
 rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "a6a59e697df7e7a7c95b91c915d1a24e00681760" }
 
@@ -15,6 +16,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Attachments: a file's type from its name, and opening a downloaded file in its default app.
+mime_guess = "2"
+open = "5"
 # Installs and updates (Setup.exe, AppImage, .pkg), fed from the GitHub releases.
 velopack = "1.2.161"
 
