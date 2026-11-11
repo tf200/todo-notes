@@ -16,6 +16,9 @@
 # Without them the build is unsigned: fine on your own Mac, blocked by Gatekeeper elsewhere.
 set -euo pipefail
 
+# Braces: bash reads the whole script before running it, since it checks out the release tag
+# below, which can replace this very file mid-run.
+{
 VERSION="${1:?usage: ./release-mac.sh <version> [--local]}"
 LOCAL="${2:-}"
 REPO=https://github.com/tf200/todo-notes
@@ -78,3 +81,5 @@ vpk upload github -o "$OUT" --channel osx --repoUrl "$REPO" --token "$TOKEN" \
   --tag "$TAG" --releaseName "$TITLE $VERSION" --publish --merge
 git checkout -q main
 say "macOS added to $REPO/releases/tag/$TAG"
+exit
+}
