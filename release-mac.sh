@@ -66,7 +66,7 @@ else
   say "No signing identity set: the build is unsigned"
 fi
 vpk pack -u "$PACK_ID" -v "$VERSION" -p "$STAGE" -e todo-notes -o "$OUT" --channel osx \
-  -i assets/icon/icon.icns --packTitle "$PACK_TITLE" --packAuthors Taha "${SIGN[@]}"
+  -i assets/icon/icon.icns --packTitle "$PACK_TITLE" --packAuthors Taha ${SIGN[@]+"${SIGN[@]}"}
 
 if [ "$LOCAL" = "--local" ]; then
   say "Packed into $OUT (nothing uploaded)"
