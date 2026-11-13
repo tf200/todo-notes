@@ -301,6 +301,7 @@ fn sample_todos(s: &mut App, list: usize) {
                 description: notes.into(),
                 due_at: due(id),
                 done,
+                stage: None,
                 created_at: "2026-11-02T10:00:00Z".into(),
             })
             .collect();
@@ -308,6 +309,22 @@ fn sample_todos(s: &mut App, list: usize) {
         step(&mut s.todos, T::Reply(Reply::Tasks { list: lid.to_string(), result: Ok(mine) }));
     }
     step(&mut s.todos, T::Select(lists[list].0.to_string()));
+}
+
+/// `sample_todos` with the steps "To show" and "Waiting on client", and tasks in them.
+fn sample_workflow(s: &mut App) {
+    use crate::api::Stage;
+    use crate::todos::{Event as T, Place, Reply};
+    sample_todos(s, 0);
+    let stage = |id: &str, name: &str, color: &str| Stage { id: id.into(), name: name.into(), color: color.into() };
+    s.todo(T::Reply(Reply::Stages(Ok(vec![
+        stage("show", "To show", "#f59e0b"),
+        stage("wait", "Waiting on client", "#3b82f6"),
+    ]))));
+    s.todo(T::Move { id: "t2".into(), to: Place::Stage("show".into()) });
+    s.todo(T::Move { id: "t1".into(), to: Place::Stage("show".into()) });
+    s.todo(T::Move { id: "t5".into(), to: Place::Stage("wait".into()) });
+    s.todo(T::DismissUndo);
 }
 
 /// Fixed states for headless screenshots: `--scene <name>`.
@@ -384,6 +401,19 @@ pub const SCENES: &[(&str, fn(&mut App))] = &[
         sample_todos(s, 0);
         s.section = crate::Section::Notes;
         s.note(crate::notes::Event::Reply(crate::todos::Reply::Notes(Ok(vec![]))));
+    }),
+    ("workflow", |s| sample_workflow(s)),
+    ("workflow-details", |s| {
+        sample_workflow(s);
+        s.open_task("t2".into());
+    }),
+    ("workflow-undo", |s| {
+        sample_workflow(s);
+        s.todo(crate::todos::Event::Advance("t3".into()));
+    }),
+    ("workflow-editor", |s| {
+        sample_workflow(s);
+        s.open_workflow();
     }),
     ("todos-none", |s| {
         sample_todos(s, 0);

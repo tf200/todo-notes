@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use crate::api::{ApiError, Note, NotePatch, Task, TaskList, TaskPatch};
+use crate::api::{ApiError, Note, NotePatch, Stage, Task, TaskList, TaskPatch};
 
 #[cfg(test)]
 mod tests;
@@ -37,6 +37,30 @@ pub struct Todos {
     /// Which sign-in this is: replies queued for an earlier one are dropped.
     pub epoch: u64,
     next_temp: u64,
+    /// The workflow's steps between to do and done, in order.
+    pub stages: Vec<Stage>,
+    /// The last move, which can be undone until it's dismissed.
+    pub moved: Option<Moved>,
+    moves: u64,
+}
+
+/// Where a task is in the workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Place {
+    Todo,
+    /// In a step (its id).
+    Stage(String),
+    Done,
+}
+
+/// A task's last move, for "Moved to … · Undo".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Moved {
+    pub task: String,
+    pub from: Place,
+    pub to: Place,
+    /// Counts moves, so the screen can tell a new one from the one it already shows.
+    pub n: u64,
 }
 
 impl Default for Todos {
@@ -49,6 +73,9 @@ impl Default for Todos {
             notice: None,
             epoch: 0,
             next_temp: 0,
+            stages: Vec::new(),
+            moved: None,
+            moves: 0,
         }
     }
 }
@@ -64,6 +91,8 @@ pub enum Op {
     CreateTask { tmp: String, list: String, title: String },
     UpdateTask { id: String, patch: TaskPatch },
     DeleteTask { id: String },
+    LoadStages,
+    SaveStages(Vec<Stage>),
     // Notes (`notes.rs`).
     LoadNotes,
     CreateNote { tmp: String, title: String, body: String },
@@ -80,6 +109,8 @@ pub enum Reply {
     TaskCreated { tmp: String, list: String, result: Result<Task, ApiError> },
     /// A rename, update or delete.
     Saved(Result<(), ApiError>),
+    Stages(Result<Vec<Stage>, ApiError>),
+    StagesSaved(Result<Vec<Stage>, ApiError>),
     // Notes (`notes.rs`).
     Notes(Result<Vec<Note>, ApiError>),
     NoteCreated { tmp: String, result: Result<Note, ApiError> },
@@ -105,6 +136,16 @@ pub enum Event {
     /// A task at the end of the selected list.
     AddTask(String),
     SetDone { id: String, done: bool },
+    /// Moves a task to a place in the workflow (undoable).
+    Move { id: String, to: Place },
+    /// Moves a task one place on: to do, each step, done, and from done back to to do.
+    Advance(String),
+    /// Puts the last moved task back where it was.
+    Undo,
+    /// Forgets the last move (its undo offer has timed out).
+    DismissUndo,
+    /// Replaces the workflow's steps. Tasks in a removed step move back a step.
+    SaveStages(Vec<Stage>),
     /// Sets the day a task is due (a `due_at` stamp), or removes it.
     SetDue { id: String, due: Option<String> },
     /// Saves the details pane's title and description.
@@ -142,6 +183,80 @@ impl Todos {
 
     pub fn tasks_of(&self, list: &str) -> Option<&Load<Vec<Task>>> {
         self.tasks.get(list)
+    }
+
+    /// Where a task is. A step that isn't in the workflow (any more) reads as to do.
+    pub fn place(&self, t: &Task) -> Place {
+        match &t.stage {
+            _ if t.done => Place::Done,
+            Some(id) if self.stages.iter().any(|s| &s.id == id) => Place::Stage(id.clone()),
+            _ => Place::Todo,
+        }
+    }
+
+    /// Every place, in order: to do, the steps, done.
+    pub fn places(&self) -> Vec<Place> {
+        let mut all = vec![Place::Todo];
+        all.extend(self.stages.iter().map(|s| Place::Stage(s.id.clone())));
+        all.push(Place::Done);
+        all
+    }
+
+    /// The place after `p`; after done comes to do again.
+    pub fn next_place(&self, p: &Place) -> Place {
+        let all = self.places();
+        let at = all.iter().position(|x| x == p).unwrap_or(0);
+        all.get(at + 1).cloned().unwrap_or(Place::Todo)
+    }
+
+    pub fn stage(&self, id: &str) -> Option<&Stage> {
+        self.stages.iter().find(|s| s.id == id)
+    }
+
+    /// What a place is called: "To do", a step's name, "Done".
+    pub fn place_name(&self, p: &Place) -> String {
+        match p {
+            Place::Todo => "To do".into(),
+            Place::Stage(id) => self.stage(id).map_or_else(|| "To do".into(), |s| s.name.clone()),
+            Place::Done => "Done".into(),
+        }
+    }
+
+    /// Moves a task, saving the move; returns where it was, or `None` when it was already there.
+    fn put(&mut self, id: &str, to: &Place, fx: &mut Vec<Effect>) -> Option<Place> {
+        let task = self.task(id)?;
+        let from = self.place(task);
+        if &from == to {
+            return None;
+        }
+        let task = self.task_mut(id)?;
+        let patch = match to {
+            Place::Todo => {
+                task.done = false;
+                task.stage = None;
+                TaskPatch { done: Some(false), stage: Some(String::new()), ..TaskPatch::default() }
+            }
+            Place::Stage(s) => {
+                task.done = false;
+                task.stage = Some(s.clone());
+                TaskPatch { stage: Some(s.clone()), ..TaskPatch::default() }
+            }
+            Place::Done => {
+                task.done = true;
+                task.stage = None;
+                TaskPatch { done: Some(true), ..TaskPatch::default() }
+            }
+        };
+        fx.push(Effect::Run(Op::UpdateTask { id: id.to_string(), patch }));
+        Some(from)
+    }
+
+    /// Moves a task and remembers the move, so it can be undone.
+    fn move_task(&mut self, id: String, to: Place, fx: &mut Vec<Effect>) {
+        if let Some(from) = self.put(&id, &to, fx) {
+            self.moves += 1;
+            self.moved = Some(Moved { task: id, from, to, n: self.moves });
+        }
     }
 
     /// Open tasks in a loaded list.
@@ -213,6 +328,8 @@ pub fn step(t: &mut Todos, event: Event) -> Vec<Effect> {
         Event::Open => {
             let epoch = t.epoch + 1;
             *t = Todos { epoch, ..Todos::default() };
+            // The steps first: the worker runs in order, so they're in before any tasks.
+            fx.push(Effect::Run(Op::LoadStages));
             fx.push(Effect::Run(Op::LoadLists));
         }
         Event::Reload => {
@@ -220,6 +337,7 @@ pub fn step(t: &mut Todos, event: Event) -> Vec<Effect> {
             if matches!(t.lists, Load::Failed(_)) {
                 t.lists = Load::Loading;
             }
+            fx.push(Effect::Run(Op::LoadStages));
             fx.push(Effect::Run(Op::LoadLists));
             if let Some(list) = t.selected.clone().filter(|l| !is_temp(l)) {
                 if matches!(t.tasks.get(&list), Some(Load::Failed(_))) {
@@ -288,18 +406,57 @@ pub fn step(t: &mut Todos, event: Event) -> Vec<Effect> {
                     description: String::new(),
                     due_at: None,
                     done: false,
+                    stage: None,
                     created_at: String::new(),
                 });
             }
             fx.push(Effect::Run(Op::CreateTask { tmp, list, title }));
         }
         Event::SetDone { id, done } => {
-            let Some(task) = t.task_mut(&id) else { return fx };
+            let Some(task) = t.task(&id) else { return fx };
             if task.done == done {
                 return fx;
             }
-            task.done = done;
-            fx.push(Effect::Run(Op::UpdateTask { id, patch: TaskPatch { done: Some(done), ..TaskPatch::default() } }));
+            t.move_task(id, if done { Place::Done } else { Place::Todo }, &mut fx);
+        }
+        Event::Move { id, to } => t.move_task(id, to, &mut fx),
+        Event::Advance(id) => {
+            let Some(task) = t.task(&id) else { return fx };
+            let to = t.next_place(&t.place(task));
+            t.move_task(id, to, &mut fx);
+        }
+        Event::Undo => {
+            if let Some(m) = t.moved.take() {
+                t.put(&m.task, &m.from, &mut fx);
+            }
+        }
+        Event::DismissUndo => t.moved = None,
+        Event::SaveStages(stages) => {
+            let stages: Vec<Stage> = stages
+                .into_iter()
+                .map(|s| Stage { name: s.name.trim().to_string(), ..s })
+                .filter(|s| !s.name.is_empty())
+                .collect();
+            if stages == t.stages {
+                return fx;
+            }
+            // As the server does: tasks in a removed step go to the nearest kept step before it.
+            let moves = removed(&t.stages, &stages);
+            for load in t.tasks.values_mut() {
+                if let Load::Ready(tasks) = load {
+                    for x in tasks.iter_mut() {
+                        if let Some(to) = x.stage.as_ref().and_then(|s| moves.get(s)) {
+                            x.stage = to.clone();
+                        }
+                    }
+                }
+            }
+            let gone = |p: &Place| matches!(p, Place::Stage(s) if moves.contains_key(s));
+            if t.moved.as_ref().is_some_and(|m| gone(&m.from) || gone(&m.to)) {
+                t.moved = None;
+            }
+            t.stages = stages.clone();
+            fx.push(Effect::Run(Op::SaveStages(stages)));
         }
         Event::SetDue { id, due } => {
             let Some(task) = t.task_mut(&id) else { return fx };
@@ -340,6 +497,9 @@ pub fn step(t: &mut Todos, event: Event) -> Vec<Effect> {
             }
             if t.open_task.as_ref() == Some(&id) {
                 t.open_task = None;
+            }
+            if t.moved.as_ref().is_some_and(|m| m.task == id) {
+                t.moved = None;
             }
             fx.push(Effect::Run(Op::DeleteTask { id }));
         }
@@ -453,8 +613,42 @@ fn reply_step(t: &mut Todos, reply: Reply, fx: &mut Vec<Effect>) {
             t.failed("Couldn't add the task.", &e, fx);
         }
         Reply::Saved(Ok(())) => {}
+        Reply::Stages(Ok(stages)) => t.stages = stages,
+        Reply::Stages(Err(ApiError::Unauthorized)) | Reply::StagesSaved(Err(ApiError::Unauthorized)) => {
+            fx.push(Effect::Unauthorized)
+        }
+        // A server without workflows (404) or a failed load: no steps, tasks are to do or done.
+        Reply::Stages(Err(_)) => {}
+        Reply::StagesSaved(Ok(stages)) => t.stages = stages,
+        Reply::StagesSaved(Err(e)) => {
+            t.failed("Couldn't save the workflow.", &e, fx);
+            fx.push(Effect::Run(Op::LoadStages));
+        }
         Reply::Saved(Err(e)) => t.failed("Couldn't save your change.", &e, fx),
         // `notes::step` handles these; `main.rs` routes them there.
         Reply::Notes(_) | Reply::NoteCreated { .. } | Reply::NoteSaved(_) | Reply::NoteDeleted(_) => {}
     }
+}
+
+/// Where the tasks of each step in `old` that isn't in `next` go: the nearest kept step before
+/// it, or `None` (to do). The server does the same with its copy.
+pub fn removed(old: &[Stage], next: &[Stage]) -> HashMap<String, Option<String>> {
+    let mut moves = HashMap::new();
+    let mut last = None;
+    for s in old {
+        if next.iter().any(|n| n.id == s.id) {
+            last = Some(s.id.clone());
+        } else {
+            moves.insert(s.id.clone(), last.clone());
+        }
+    }
+    moves
+}
+
+/// A new step's id: unique enough for one user's handful of steps.
+pub fn new_stage_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    format!("s{nanos:x}{:x}", N.fetch_add(1, Ordering::Relaxed))
 }

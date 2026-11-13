@@ -306,6 +306,8 @@ fn run(api: &Api, creds: &Creds, op: Op, ids: &mut HashMap<String, String>) -> O
             let task = id(ids, &task)?;
             Reply::Saved(creds.call(|t| api.delete_task(t, &task)))
         }
+        Op::LoadStages => Reply::Stages(creds.call(|t| api.stages(t))),
+        Op::SaveStages(stages) => Reply::StagesSaved(creds.call(|t| api.save_stages(t, &stages))),
         Op::LoadNotes => Reply::Notes(creds.call(|t| api.notes(t))),
         Op::CreateNote { tmp, title, body } => {
             let result = creds.call(|t| api.create_note(t, &title, &body));

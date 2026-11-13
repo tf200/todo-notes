@@ -12,6 +12,7 @@ fn task(id: &str, list: &str, title: &str, done: bool) -> Task {
         description: String::new(),
         due_at: None,
         done,
+        stage: None,
         created_at: String::new(),
     }
 }
@@ -45,7 +46,7 @@ fn titles(t: &Todos, list: &str) -> Vec<String> {
 #[test]
 fn open_loads_lists_then_the_first_lists_tasks() {
     let mut t = Todos::default();
-    assert_eq!(step(&mut t, Event::Open), vec![run(Op::LoadLists)]);
+    assert_eq!(step(&mut t, Event::Open), vec![run(Op::LoadStages), run(Op::LoadLists)]);
     assert_eq!(t.lists, Load::Loading);
     let fx = step(&mut t, Event::Reply(Reply::Lists(Ok(vec![list("a", "Home"), list("b", "Work")]))));
     assert_eq!(fx, vec![run(Op::LoadTasks { list: "a".into() })]);
@@ -86,7 +87,7 @@ fn first_load_failure_shows_and_reload_retries() {
     step(&mut t, Event::Open);
     step(&mut t, Event::Reply(Reply::Lists(Err(ApiError::Unreachable))));
     assert_eq!(t.lists, Load::Failed(ApiError::Unreachable));
-    assert_eq!(step(&mut t, Event::Reload), vec![run(Op::LoadLists)]);
+    assert_eq!(step(&mut t, Event::Reload), vec![run(Op::LoadStages), run(Op::LoadLists)]);
     assert_eq!(t.lists, Load::Loading);
 }
 
@@ -221,4 +222,85 @@ fn a_new_sign_in_starts_over() {
     assert_eq!(t.epoch, epoch + 1);
     assert_eq!(t.lists, Load::Loading);
     assert!(t.tasks.is_empty());
+}
+
+fn stage(id: &str, name: &str) -> Stage {
+    Stage { id: id.into(), name: name.into(), color: "#f59e0b".into() }
+}
+
+/// `loaded`, with the steps "To show" (`show`) and "Waiting" (`wait`).
+fn with_stages() -> Todos {
+    let mut t = loaded();
+    step(&mut t, Event::Reply(Reply::Stages(Ok(vec![stage("show", "To show"), stage("wait", "Waiting")]))));
+    t
+}
+
+fn place(t: &Todos, id: &str) -> Place {
+    t.place(t.task(id).unwrap())
+}
+
+#[test]
+fn advancing_walks_the_steps_then_wraps_to_to_do() {
+    let mut t = with_stages();
+    let fx = step(&mut t, Event::Advance("t1".into()));
+    assert_eq!(place(&t, "t1"), Place::Stage("show".into()));
+    let patch = TaskPatch { stage: Some("show".into()), ..TaskPatch::default() };
+    assert_eq!(fx, vec![run(Op::UpdateTask { id: "t1".into(), patch })]);
+    step(&mut t, Event::Advance("t1".into()));
+    assert_eq!(place(&t, "t1"), Place::Stage("wait".into()));
+    let fx = step(&mut t, Event::Advance("t1".into()));
+    assert_eq!(place(&t, "t1"), Place::Done);
+    assert_eq!(fx, vec![run(Op::UpdateTask { id: "t1".into(), patch: TaskPatch { done: Some(true), ..TaskPatch::default() } })]);
+    let fx = step(&mut t, Event::Advance("t1".into()));
+    assert_eq!(place(&t, "t1"), Place::Todo);
+    let back = TaskPatch { done: Some(false), stage: Some(String::new()), ..TaskPatch::default() };
+    assert_eq!(fx, vec![run(Op::UpdateTask { id: "t1".into(), patch: back })]);
+}
+
+#[test]
+fn without_steps_advancing_is_a_tick() {
+    let mut t = loaded();
+    step(&mut t, Event::Advance("t1".into()));
+    assert_eq!(place(&t, "t1"), Place::Done);
+    step(&mut t, Event::Advance("t1".into()));
+    assert_eq!(place(&t, "t1"), Place::Todo);
+}
+
+#[test]
+fn undo_puts_the_task_back() {
+    let mut t = with_stages();
+    step(&mut t, Event::Move { id: "t1".into(), to: Place::Stage("wait".into()) });
+    let m = t.moved.clone().unwrap();
+    assert_eq!((m.from, m.to), (Place::Todo, Place::Stage("wait".into())));
+    let fx = step(&mut t, Event::Undo);
+    assert_eq!(place(&t, "t1"), Place::Todo);
+    assert_eq!(fx.len(), 1);
+    // The undo itself isn't offered for undoing.
+    assert_eq!(t.moved, None);
+    // Moving to where it already is does nothing.
+    assert!(step(&mut t, Event::Move { id: "t1".into(), to: Place::Todo }).is_empty());
+}
+
+#[test]
+fn a_removed_step_sends_its_tasks_back_a_step() {
+    let mut t = with_stages();
+    step(&mut t, Event::Move { id: "t1".into(), to: Place::Stage("wait".into()) });
+    let fx = step(&mut t, Event::SaveStages(vec![stage("show", "To show"), stage("new", "  New  "), stage("x", " ")]));
+    let saved = vec![stage("show", "To show"), stage("new", "New")];
+    assert_eq!(fx, vec![run(Op::SaveStages(saved.clone()))]);
+    assert_eq!(t.stages, saved);
+    assert_eq!(place(&t, "t1"), Place::Stage("show".into()));
+    // The undo was about a step that's gone.
+    assert_eq!(t.moved, None);
+    // A step the client doesn't know reads as to do.
+    t.stages.clear();
+    assert_eq!(place(&t, "t1"), Place::Todo);
+}
+
+#[test]
+fn a_server_without_workflows_still_works() {
+    let mut t = loaded();
+    assert!(step(&mut t, Event::Reply(Reply::Stages(Err(ApiError::NotFound)))).is_empty());
+    assert!(t.stages.is_empty());
+    assert_eq!(t.notice, None);
 }

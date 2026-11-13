@@ -88,8 +88,21 @@ pub struct Task {
     pub due_at: Option<String>,
     #[serde(default)]
     pub done: bool,
+    /// The workflow step it's in (a [`Stage`] id), when it's in one.
+    #[serde(default)]
+    pub stage: Option<String>,
     #[serde(default)]
     pub created_at: String,
+}
+
+/// A step of the user's workflow between "to do" and "done", such as "To show"
+/// (`/api/stages`). The ids are made here, so a task can move into a new step at once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Stage {
+    pub id: String,
+    pub name: String,
+    /// `#rrggbb`.
+    pub color: String,
 }
 
 /// The fields of a task to change (`PUT /api/tasks/:id`); `None` leaves a field as it is.
@@ -101,6 +114,9 @@ pub struct TaskPatch {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub done: Option<bool>,
+    /// A step's id moves the task into that step; `""` takes it out (back to to do).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
     /// `Some(None)` sends `"due_at": null`, which removes the due date.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub due_at: Option<Option<String>>,
@@ -335,6 +351,22 @@ impl Api {
     pub fn delete_task(&self, token: &str, id: &str) -> Result<(), ApiError> {
         let req = self.agent.delete(self.url(&format!("/api/tasks/{id}"))).header("Authorization", bearer(token));
         self.expect_ok(req.call())
+    }
+
+    /// `GET /api/stages`: the workflow's steps, in order.
+    pub fn stages(&self, token: &str) -> Result<Vec<Stage>, ApiError> {
+        let req = self.agent.get(self.url("/api/stages")).header("Authorization", bearer(token));
+        self.read_vec::<Stage>(req.call())
+    }
+
+    /// `PUT /api/stages`: replaces the workflow; tasks in a removed step move back a step.
+    pub fn save_stages(&self, token: &str, stages: &[Stage]) -> Result<Vec<Stage>, ApiError> {
+        let req = self.agent.put(self.url("/api/stages")).header("Authorization", bearer(token));
+        let (status, mut resp) = self.send(req.send_json(json!({ "stages": stages })))?;
+        match status {
+            200 => read_json::<Option<Vec<Stage>>>(&mut resp).map(Option::unwrap_or_default),
+            s => Err(api_status(s)),
+        }
     }
 
     /// `GET /api/notes`: the user's notes, most recently edited first.

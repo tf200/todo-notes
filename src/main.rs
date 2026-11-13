@@ -89,7 +89,15 @@ pub struct App {
     /// When the details pane's edits save by themselves (window clock seconds): a short pause
     /// after the last keystroke.
     pub save_due: Option<f64>,
-    pub show_done: bool,
+    /// Sections of the task list folded away: a step's, or done's.
+    pub collapsed: std::collections::HashSet<todos::Place>,
+    /// The details pane's status picker is open.
+    pub stage_picker: bool,
+    /// The workflow editor, while it's open: the steps as they're being edited.
+    pub workflow: Option<Vec<DraftStage>>,
+    /// The move the undo toast is showing (`todos::Moved::n`), and when it goes away.
+    undo_seen: u64,
+    undo_until: f64,
     /// The user's local date, for due labels; kept current by `poll`.
     pub today: chrono::NaiveDate,
     /// The details pane's due-date picker, open on this month.
@@ -117,6 +125,16 @@ pub struct App {
     /// New versions, found and downloaded in the background.
     pub updates: updates::Updates,
 }
+
+/// A step in the workflow editor.
+pub struct DraftStage {
+    pub id: String,
+    pub name: TextEdit,
+    pub color: String,
+}
+
+/// Seconds the "Moved to …" toast offers its undo.
+const UNDO_FOR: f64 = 6.0;
 
 /// Seconds after the last keystroke before an edit saves itself.
 pub const AUTOSAVE_PAUSE: f64 = 0.8;
@@ -557,6 +575,65 @@ impl App {
         }
     }
 
+    // The workflow editor.
+
+    pub fn open_workflow(&mut self) {
+        self.menu = None;
+        let drafts = self
+            .todos
+            .stages
+            .iter()
+            .map(|st| DraftStage { id: st.id.clone(), name: TextEdit::new(st.name.clone()), color: st.color.clone() })
+            .collect();
+        self.workflow = Some(drafts);
+    }
+
+    /// A new, empty step at the end, with the next unused colour; its name field takes focus.
+    pub fn add_draft(&mut self, tx: &mut Tx) {
+        let Some(w) = &mut self.workflow else { return };
+        let used: Vec<&str> = w.iter().map(|d| d.color.as_str()).collect();
+        let color = todos_ui::STAGE_COLORS
+            .iter()
+            .find(|c| !used.contains(c))
+            .unwrap_or(&todos_ui::STAGE_COLORS[w.len() % todos_ui::STAGE_COLORS.len()])
+            .to_string();
+        let id = todos::new_stage_id();
+        w.push(DraftStage { id: id.clone(), name: TextEdit::new(""), color });
+        tx.focus(&format!("stage-name-{id}"), false);
+    }
+
+    pub fn move_draft(&mut self, id: &str, by: isize) {
+        let Some(w) = &mut self.workflow else { return };
+        let Some(at) = w.iter().position(|d| d.id == id) else { return };
+        let to = at as isize + by;
+        if to >= 0 && (to as usize) < w.len() {
+            w.swap(at, to as usize);
+        }
+    }
+
+    pub fn remove_draft(&mut self, id: &str) {
+        if let Some(w) = &mut self.workflow {
+            w.retain(|d| d.id != id);
+        }
+    }
+
+    pub fn cycle_draft_color(&mut self, id: &str) {
+        let Some(d) = self.workflow.as_mut().and_then(|w| w.iter_mut().find(|d| d.id == id)) else { return };
+        let colors = &todos_ui::STAGE_COLORS;
+        let at = colors.iter().position(|c| *c == d.color).map_or(0, |i| (i + 1) % colors.len());
+        d.color = colors[at].to_string();
+    }
+
+    /// Saves the editor's steps (blank ones are dropped) and closes it.
+    pub fn save_workflow(&mut self) {
+        let Some(w) = self.workflow.take() else { return };
+        let stages = w
+            .into_iter()
+            .map(|d| api::Stage { id: d.id, name: d.name.text.clone(), color: d.color })
+            .collect();
+        self.todo(todos::Event::SaveStages(stages));
+    }
+
     pub fn commit_rename(&mut self) {
         let title = self.rename.text.clone();
         match self.renaming.take() {
@@ -601,7 +678,11 @@ fn init() -> App {
         task_title: TextEdit::new(""),
         task_notes: TextEdit::new(""),
         save_due: None,
-        show_done: true,
+        collapsed: std::collections::HashSet::new(),
+        stage_picker: false,
+        workflow: None,
+        undo_seen: 0,
+        undo_until: 0.0,
         today: dates::today(),
         due_picker: None,
         menu: None,
@@ -632,7 +713,7 @@ fn setup(s: &mut App, waker: Waker) {
     s.dispatch(Event::Launch { saved, now: session::now_unix() });
 }
 
-fn poll(s: &mut App, now: f64, _tx: &mut Tx) -> bool {
+fn poll(s: &mut App, now: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
     // The background moves while the sign-in screens show; signed in, it rests.
     if !s.signed_in() && !s.still.get() {
@@ -655,6 +736,19 @@ fn poll(s: &mut App, now: f64, _tx: &mut Tx) -> bool {
     if today != s.today {
         s.today = today;
         changed = true;
+    }
+    // The undo toast: shown for a while after each move, then gone.
+    match s.todos.moved.as_ref().map(|m| m.n) {
+        Some(n) if n != s.undo_seen => {
+            s.undo_seen = n;
+            s.undo_until = now + UNDO_FOR;
+            tx.wake_at(s.undo_until);
+        }
+        Some(_) if now >= s.undo_until => {
+            s.todo(todos::Event::DismissUndo);
+            changed = true;
+        }
+        _ => {}
     }
     if s.save_due.is_some_and(|due| now >= due) {
         s.save_open_task();
